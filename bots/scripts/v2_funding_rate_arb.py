@@ -71,6 +71,27 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
             "prompt": lambda mi: "Do you want to check the trade profitability condition to enter? (True/False): ",
             "prompt_on_new": True}
     )
+    dynamic_position_sizing: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": lambda mi: "Enable dynamic position sizing based on order book depth? (True/False): ",
+            "prompt_on_new": True,
+        }
+    )
+    max_orderbook_depth_ratio: Decimal = Field(
+        default=Decimal("0.3"),
+        json_schema_extra={
+            "prompt": lambda mi: "Max ratio of top-10 order book depth to consume (e.g. 0.3 for 30%): ",
+            "prompt_on_new": True,
+        }
+    )
+    min_position_size_quote: Decimal = Field(
+        default=Decimal("100"),
+        json_schema_extra={
+            "prompt": lambda mi: "Minimum position size in quote asset to open (e.g. 100): ",
+            "prompt_on_new": True,
+        }
+    )
 
     @field_validator("connectors", "tokens", mode="before")
     @classmethod
@@ -581,6 +602,66 @@ class FundingRateArbitrage(StrategyV2Base):
                         f"Rate={float(rate):+.6%}, Settlement={float(payment_amount):+.4f} Quote"
                     )
 
+    def calculate_dynamic_position_size(
+        self,
+        token: str,
+        connector_1: str,
+        connector_2: str,
+        trade_side: TradeType,
+        max_target_size: Decimal
+    ) -> Decimal:
+        """
+        Dynamically calculate safe position size based on order book depth of both exchanges.
+        Takes the minimum safe capacity between connector 1 and connector 2 to guarantee
+        neither leg exceeds the order book depth limit or suffers excessive slippage.
+        """
+        try:
+            depth_ratio = Decimal(str(getattr(self.config, "max_orderbook_depth_ratio", 0.3)))
+            min_size = Decimal(str(getattr(self.config, "min_position_size_quote", 100)))
+
+            safe_capacities = []
+            legs = [
+                (connector_1, trade_side == TradeType.BUY),
+                (connector_2, trade_side != TradeType.BUY)
+            ]
+
+            for conn_name, is_buy in legs:
+                tp = self.get_trading_pair_for_connector(token, conn_name)
+                ob = self.market_data_provider.get_order_book(conn_name, tp)
+                if ob is not None:
+                    bids_df, asks_df = ob.snapshot
+                    df = asks_df if is_buy else bids_df
+                    if df is not None and not df.empty:
+                        # Top 10 levels quote depth
+                        top_n = df.head(10)
+                        depth_usd = Decimal(str(float((top_n["price"] * top_n["amount"]).sum())))
+                        safe_cap = depth_usd * depth_ratio
+                        if safe_cap > 0:
+                            safe_capacities.append(safe_cap)
+
+            if safe_capacities:
+                bottleneck_capacity = min(safe_capacities)
+                calculated_size = min(max_target_size, bottleneck_capacity)
+                if calculated_size >= min_size:
+                    step = Decimal("50")
+                    rounded_size = (calculated_size // step) * step
+                    final_size = max(min_size, rounded_size)
+                    self.logger().info(
+                        f"[DYNAMIC-SIZING] Token {token}: Target=${float(max_target_size):,.0f}, "
+                        f"OrderBook Safe Capacity=${float(bottleneck_capacity):,.0f} -> Dynamic Size: ${float(final_size):,.0f}"
+                    )
+                    return final_size
+                else:
+                    self.logger().warning(
+                        f"[DYNAMIC-SIZING] Token {token}: OrderBook safe capacity (${float(bottleneck_capacity):,.1f}) "
+                        f"is below min allowed (${float(min_size):,.1f}). Using min size."
+                    )
+                    return min_size
+        except Exception as e:
+            self.logger().debug(f"Dynamic sizing calculation error for {token}: {e}")
+
+        return max_target_size
+
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
         """
         Evaluate if a new set of positions has to be created for each token without active arbitrage.
@@ -615,6 +696,16 @@ class FundingRateArbitrage(StrategyV2Base):
                         f"Trading profitability after fees: {current_profitability:.4%}"
                     )
 
+                    pos_size = self.config.position_size_quote
+                    if getattr(self.config, "dynamic_position_sizing", True):
+                        pos_size = self.calculate_dynamic_position_size(
+                            token=token,
+                            connector_1=connector_1,
+                            connector_2=connector_2,
+                            trade_side=trade_side,
+                            max_target_size=self.config.position_size_quote,
+                        )
+
                     if self.config.dry_run:
                         # Open Virtual Position in Sandbox
                         trading_pair_1 = self.get_trading_pair_for_connector(token, connector_1)
@@ -622,13 +713,13 @@ class FundingRateArbitrage(StrategyV2Base):
                         p1 = self.get_safe_quote_price(
                             connector_name=connector_1,
                             trading_pair=trading_pair_1,
-                            quote_volume=self.config.position_size_quote,
+                            quote_volume=pos_size,
                             is_buy=trade_side == TradeType.BUY,
                         )
                         p2 = self.get_safe_quote_price(
                             connector_name=connector_2,
                             trading_pair=trading_pair_2,
-                            quote_volume=self.config.position_size_quote,
+                            quote_volume=pos_size,
                             is_buy=trade_side != TradeType.BUY,
                         )
                         fee_pct_1 = self.connectors[connector_1].get_fee(
@@ -636,7 +727,7 @@ class FundingRateArbitrage(StrategyV2Base):
                             quote_currency=trading_pair_1.split("-")[1],
                             order_type=OrderType.MARKET,
                             order_side=TradeType.BUY,
-                            amount=self.config.position_size_quote / p1,
+                            amount=pos_size / p1,
                             price=p1,
                             is_maker=False,
                             position_action=PositionAction.OPEN
@@ -646,7 +737,7 @@ class FundingRateArbitrage(StrategyV2Base):
                             quote_currency=trading_pair_2.split("-")[1],
                             order_type=OrderType.MARKET,
                             order_side=TradeType.BUY,
-                            amount=self.config.position_size_quote / p2,
+                            amount=pos_size / p2,
                             price=p2,
                             is_maker=False,
                             position_action=PositionAction.OPEN
@@ -660,10 +751,10 @@ class FundingRateArbitrage(StrategyV2Base):
                             "open_timestamp": self.current_timestamp,
                             "price_1": p1,
                             "price_2": p2,
-                            "amount_1": self.config.position_size_quote / p1,
-                            "amount_2": self.config.position_size_quote / p2,
-                            "position_size_quote": self.config.position_size_quote,
-                            "entry_fee_quote": (fee_pct_1 + fee_pct_2) * self.config.position_size_quote,
+                            "amount_1": pos_size / p1,
+                            "amount_2": pos_size / p2,
+                            "position_size_quote": pos_size,
+                            "entry_fee_quote": (fee_pct_1 + fee_pct_2) * pos_size,
                             "expected_profitability": expected_profitability,
                             "entry_profitability_after_fees": current_profitability,
                             "funding_payments": [],
@@ -675,13 +766,14 @@ class FundingRateArbitrage(StrategyV2Base):
                             f"[DRY-RUN] Virtual Arbitrage Position Established for {token}!\n"
                             f"  Leg 1 ({connector_1}): {'BUY' if trade_side == TradeType.BUY else 'SELL'} @ {p1:.4f}\n"
                             f"  Leg 2 ({connector_2}): {'SELL' if trade_side == TradeType.BUY else 'BUY'} @ {p2:.4f}\n"
+                            f"  Notional Size: ${float(pos_size):,.2f}\n"
                             f"  Daily Rate Diff: {expected_profitability:.4%}, Net Entry Spread: {current_profitability:.4%}"
                         )
                     else:
                         # Real Live Trading Executors
-                        self.logger().info("Starting live executors...")
+                        self.logger().info(f"Starting live executors for {token} with dynamic size ${float(pos_size):,.2f}...")
                         position_executor_config_1, position_executor_config_2 = self.get_position_executors_config(
-                            token, connector_1, connector_2, trade_side
+                            token, connector_1, connector_2, trade_side, position_size_quote=pos_size
                         )
                         self.active_funding_arbitrages[token] = {
                             "is_virtual": False,
@@ -689,6 +781,7 @@ class FundingRateArbitrage(StrategyV2Base):
                             "connector_2": connector_2,
                             "executors_ids": [position_executor_config_1.id, position_executor_config_2.id],
                             "side": trade_side,
+                            "position_size_quote": pos_size,
                             "funding_payments": [],
                         }
                         return [CreateExecutorAction(executor_config=position_executor_config_1),
@@ -813,13 +906,14 @@ class FundingRateArbitrage(StrategyV2Base):
         if token in self.active_funding_arbitrages:
             self.active_funding_arbitrages[token]["funding_payments"].append(funding_payment_completed_event)
 
-    def get_position_executors_config(self, token, connector_1, connector_2, trade_side):
+    def get_position_executors_config(self, token, connector_1, connector_2, trade_side, position_size_quote=None):
+        size = Decimal(str(position_size_quote)) if position_size_quote is not None else self.config.position_size_quote
         price = self.market_data_provider.get_price_by_type(
             connector_name=connector_1,
             trading_pair=self.get_trading_pair_for_connector(token, connector_1),
             price_type=PriceType.MidPrice
         )
-        position_amount = self.config.position_size_quote / price
+        position_amount = size / price
 
         position_executor_config_1 = PositionExecutorConfig(
             timestamp=self.current_timestamp,
