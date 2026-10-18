@@ -1,6 +1,7 @@
 # 永续合约资金费率套利系统：全量知识沉淀与踩坑实战手册
 > 本文档沉淀了项目从 0 到 1 架构设计、二次开发、实盘/模拟预演（Dry-Run）演进全过程的所有核心问答、技术决策、数学模型与重大踩坑经验，旨在作为后续任何新项目、策略迭代与 AI Agent 协作的永续基石。
 > 关联全量会话交互档案：[`docs/INTERACTION_HISTORY.md`](file:///home/neo/projects/hummingbot/docs/INTERACTION_HISTORY.md)
+> 关联原始逐字全量会话归档：[`docs/transcripts/COMPLETE_RAW_CONVERSATIONS.md`](file:///home/neo/projects/hummingbot/docs/transcripts/COMPLETE_RAW_CONVERSATIONS.md)
 > 关联工作区规则文件：[`AGENTS.md`](file:///home/neo/projects/hummingbot/AGENTS.md)
 
 ---

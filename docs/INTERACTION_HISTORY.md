@@ -4,6 +4,7 @@
 > 本文档是 Hummingbot 量化套利项目自启动以来的**全景交互编年史与技术演化轨迹**。记录了人类开发者与 AI Agent 在历次会话中探讨的核心命题、排查的关键 Bug、作出的重大架构决策，以及每一次认知跃迁的真实心路历程。
 > 关联核心规则文件：[`AGENTS.md`](file:///home/neo/projects/hummingbot/AGENTS.md)
 > 关联知识库实战手册：[`docs/FUNDING_ARBITRAGE_KNOWLEDGE_BASE.md`](file:///home/neo/projects/hummingbot/docs/FUNDING_ARBITRAGE_KNOWLEDGE_BASE.md)
+> 关联原始逐字全量会话归档：[`docs/transcripts/COMPLETE_RAW_CONVERSATIONS.md`](file:///home/neo/projects/hummingbot/docs/transcripts/COMPLETE_RAW_CONVERSATIONS.md)
 
 ---
 
