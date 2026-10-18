@@ -576,6 +576,10 @@ async def deploy_v2_script(
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         unique_instance_name = f"{deployment.instance_name}-{timestamp}"
 
+        # Ensure script config filename has .yml extension if provided
+        if deployment.script_config and not deployment.script_config.endswith(('.yml', '.yaml')):
+            deployment.script_config = f"{deployment.script_config}.yml"
+
         # Update deployment with unique name
         deployment.instance_name = unique_instance_name
 

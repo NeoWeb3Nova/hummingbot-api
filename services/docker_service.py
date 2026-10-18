@@ -255,6 +255,9 @@ class DockerService:
 
         # Copy specific script config and referenced controllers if provided
         if config.script_config:
+            if not config.script_config.endswith(('.yml', '.yaml')):
+                config.script_config = f"{config.script_config}.yml"
+
             script_config_dir = os.path.join("bots", 'conf', 'scripts')
             controllers_config_dir = os.path.join("bots", 'conf', 'controllers')
             destination_scripts_config_dir = os.path.join(instance_dir, 'conf', 'scripts')
