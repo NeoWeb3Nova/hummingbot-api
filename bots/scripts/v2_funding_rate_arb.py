@@ -197,8 +197,43 @@ class FundingRateArbitrage(StrategyV2Base):
         :param timestamp: Current time.
         """
         super().start(clock, timestamp)
-        self._last_timestamp = timestamp
         self.apply_initial_setting()
+
+        # Load previous closed trades history from arbitrage_trades.json if available
+        try:
+            import json, os, time
+            now_ts = int(timestamp if timestamp is not None else time.time())
+            data_file = "/home/hummingbot/data/arbitrage_trades.json"
+            if os.path.exists(data_file):
+                with open(data_file, "r") as f:
+                    saved_info = json.load(f)
+                for ct in saved_info.get("closed_trades", []):
+                    t = ct.get("token")
+                    if t:
+                        if t not in self.stopped_funding_arbitrages:
+                            self.stopped_funding_arbitrages[t] = []
+                        self.stopped_funding_arbitrages[t].append(ct)
+                # Gracefully retire and record active positions that are being rotated out
+                for ap in saved_info.get("active_positions", []):
+                    t = ap.get("token")
+                    if t and t not in self.config.tokens:
+                        if t not in self.stopped_funding_arbitrages:
+                            self.stopped_funding_arbitrages[t] = []
+                        self.stopped_funding_arbitrages[t].append({
+                            "token": t,
+                            "connector_1": ap.get("connector_1", ""),
+                            "connector_2": ap.get("connector_2", ""),
+                            "close_reason": "Manual Rotation: Low Yield Ditch",
+                            "close_timestamp": now_ts,
+                            "open_timestamp": int(now_ts - ap.get("duration_seconds", 0)),
+                            "trading_pnl": float(ap.get("unrealized_trading_pnl", 0)),
+                            "funding_pnl": float(ap.get("funding_income", 0)),
+                            "total_net_pnl": float(ap.get("net_pnl", 0)),
+                            "leverage": int(getattr(self.config, "leverage", 3)),
+                        })
+                self.logger().info("[ROTATION] Loaded historical closed trades and retired inactive tokens.")
+        except Exception as e:
+            self.logger().debug(f"Failed to load historical closed trades: {e}")
 
         # Patch Hyperliquid WebSocket funding rate bug if needed
         try:
@@ -670,8 +705,8 @@ class FundingRateArbitrage(StrategyV2Base):
                     bids_df, asks_df = ob.snapshot
                     df = asks_df if is_buy else bids_df
                     if df is not None and not df.empty:
-                        # Top 10 levels quote depth
-                        top_n = df.head(10)
+                        # Top 25 levels quote depth (within ~0.15% tight spread)
+                        top_n = df.head(getattr(self.config, "orderbook_depth_levels", 25))
                         depth_usd = Decimal(str(float((top_n["price"] * top_n["amount"]).sum())))
                         safe_cap = depth_usd * depth_ratio
                         if safe_cap > 0:
@@ -908,9 +943,12 @@ class FundingRateArbitrage(StrategyV2Base):
                     min_dist_pct = min(dist1_pct, dist2_pct)
                     liq_buffer = Decimal(str(getattr(self.config, "liquidation_buffer_pct", 0.08)))
                     liq_defense_condition = (min_dist_pct <= liq_buffer)
+                    token_removed_condition = token not in self.config.tokens
 
-                    if take_profit_condition or current_funding_condition or liq_defense_condition:
-                        if liq_defense_condition:
+                    if take_profit_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
+                        if token_removed_condition:
+                            reason = "Manual Rotation: Low Yield Ditch"
+                        elif liq_defense_condition:
                             reason = f"Liquidation Defense (Safety Margin {float(min_dist_pct):.1%} <= {float(liq_buffer):.1%})"
                         elif take_profit_condition:
                             reason = "Take Profit"
@@ -925,6 +963,8 @@ class FundingRateArbitrage(StrategyV2Base):
                         funding_arbitrage_info["funding_pnl"] = funding_pnl
                         funding_arbitrage_info["total_net_pnl"] = total_net_pnl
                         funding_arbitrage_info["close_reason"] = reason
+                        if token not in self.stopped_funding_arbitrages:
+                            self.stopped_funding_arbitrages[token] = []
                         self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
                         del self.active_funding_arbitrages[token]
                 except Exception as e:
