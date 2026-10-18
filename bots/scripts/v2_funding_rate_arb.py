@@ -260,23 +260,30 @@ class FundingRateArbitrage(StrategyV2Base):
             try:
                 trading_pair_1 = self.get_trading_pair_for_connector(token, arb["connector_1"])
                 trading_pair_2 = self.get_trading_pair_for_connector(token, arb["connector_2"])
-                p1_curr = Decimal(str(self.market_data_provider.get_price_by_type(
+                p1_open = Decimal(str(arb.get("price_1", 0)))
+                p2_open = Decimal(str(arb.get("price_2", 0)))
+
+                is_buy = (arb["side"] == TradeType.BUY) if isinstance(arb["side"], TradeType) else (str(arb["side"]) in ["BUY", "TradeType.BUY"])
+
+                p1_curr = self.get_safe_quote_price(
                     connector_name=arb["connector_1"],
                     trading_pair=trading_pair_1,
-                    price_type=PriceType.MidPrice
-                )))
-                p2_curr = Decimal(str(self.market_data_provider.get_price_by_type(
+                    quote_volume=pos_size,
+                    is_buy=not is_buy,
+                    fallback_price=p1_open,
+                )
+                p2_curr = self.get_safe_quote_price(
                     connector_name=arb["connector_2"],
                     trading_pair=trading_pair_2,
-                    price_type=PriceType.MidPrice
-                )))
-                amt1 = arb.get("amount_1", pos_size / p1_curr)
-                amt2 = arb.get("amount_2", pos_size / p2_curr)
-                p1_open = arb.get("price_1", p1_curr)
-                p2_open = arb.get("price_2", p2_curr)
+                    quote_volume=pos_size,
+                    is_buy=is_buy,
+                    fallback_price=p2_open,
+                )
+                amt1 = Decimal(str(arb.get("amount_1", pos_size / p1_open)))
+                amt2 = Decimal(str(arb.get("amount_2", pos_size / p2_open)))
 
-                leg1_pnl = (p1_curr - p1_open) * amt1 if arb["side"] == TradeType.BUY else (p1_open - p1_curr) * amt1
-                leg2_pnl = (p2_open - p2_curr) * amt2 if arb["side"] == TradeType.BUY else (p2_curr - p2_open) * amt2
+                leg1_pnl = (p1_curr - p1_open) * amt1 if is_buy else (p1_open - p1_curr) * amt1
+                leg2_pnl = (p2_open - p2_curr) * amt2 if is_buy else (p2_curr - p2_open) * amt2
                 unrealized_trading_pnl = leg1_pnl + leg2_pnl
             except Exception:
                 pass
