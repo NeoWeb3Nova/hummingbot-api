@@ -344,6 +344,8 @@ class BotsOrchestrator:
                 status = "running"
             elif len(performance) > 0 and not recently_active:
                 status = "idle"  # Has performance data but no recent activity
+            elif recently_active:
+                status = "running"  # Script strategies without controllers are running when active
             else:
                 status = "stopped"
 
