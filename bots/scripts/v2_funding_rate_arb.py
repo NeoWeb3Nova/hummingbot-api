@@ -71,6 +71,13 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
             "prompt": lambda mi: "Do you want to check the trade profitability condition to enter? (True/False): ",
             "prompt_on_new": True}
     )
+    max_payback_hours: Decimal = Field(
+        default=Decimal("12.0"),
+        json_schema_extra={
+            "prompt": lambda mi: "Max payback hours to accept entry friction vs funding yield (e.g. 12.0): ",
+            "prompt_on_new": True,
+        }
+    )
     dynamic_position_sizing: bool = Field(
         default=True,
         json_schema_extra={
@@ -400,6 +407,8 @@ class FundingRateArbitrage(StrategyV2Base):
                 "net_pnl": float(net_position_pnl),
                 "net_pnl_pct": float(net_position_pnl / pos_size) if pos_size else 0.0,
                 "duration_seconds": int(elapsed_sec),
+                "payback_hours": float(arb.get("payback_hours", 0.0)),
+                "entry_spread_pct": float(arb.get("entry_profitability_after_fees", 0.0)),
                 "next_funding_1": int(arb.get("next_funding_time_1", 0)),
                 "next_funding_2": int(arb.get("next_funding_time_2", 0)),
             })
@@ -564,24 +573,25 @@ class FundingRateArbitrage(StrategyV2Base):
 
         return Decimal("1")
 
-    def get_current_profitability_after_fees(self, token: str, connector_1: str, connector_2: str, side: TradeType):
+    def get_current_profitability_after_fees(self, token: str, connector_1: str, connector_2: str, side: TradeType, quote_volume: Decimal = None):
         """
         This methods compares the profitability of buying at market in the two exchanges. If the side is TradeType.BUY
         means that the operation is long on connector 1 and short on connector 2.
         """
+        vol = quote_volume if quote_volume is not None else self.config.position_size_quote
         trading_pair_1 = self.get_trading_pair_for_connector(token, connector_1)
         trading_pair_2 = self.get_trading_pair_for_connector(token, connector_2)
 
         connector_1_price = self.get_safe_quote_price(
             connector_name=connector_1,
             trading_pair=trading_pair_1,
-            quote_volume=self.config.position_size_quote,
+            quote_volume=vol,
             is_buy=side == TradeType.BUY,
         )
         connector_2_price = self.get_safe_quote_price(
             connector_name=connector_2,
             trading_pair=trading_pair_2,
-            quote_volume=self.config.position_size_quote,
+            quote_volume=vol,
             is_buy=side != TradeType.BUY,
         )
         estimated_fees_connector_1 = self.connectors[connector_1].get_fee(
@@ -589,7 +599,7 @@ class FundingRateArbitrage(StrategyV2Base):
             quote_currency=trading_pair_1.split("-")[1],
             order_type=OrderType.MARKET,
             order_side=TradeType.BUY,
-            amount=self.config.position_size_quote / connector_1_price,
+            amount=vol / connector_1_price,
             price=connector_1_price,
             is_maker=False,
             position_action=PositionAction.OPEN
@@ -599,7 +609,7 @@ class FundingRateArbitrage(StrategyV2Base):
             quote_currency=trading_pair_2.split("-")[1],
             order_type=OrderType.MARKET,
             order_side=TradeType.BUY,
-            amount=self.config.position_size_quote / connector_2_price,
+            amount=vol / connector_2_price,
             price=connector_2_price,
             is_maker=False,
             position_action=PositionAction.OPEN
@@ -750,9 +760,39 @@ class FundingRateArbitrage(StrategyV2Base):
 
                 connector_1, connector_2, trade_side, expected_profitability = best_combination
                 if expected_profitability >= self.config.min_funding_rate_profitability:
+                    # Dynamically size position first to reflect real orderbook capacity
+                    pos_size = self.config.position_size_quote
+                    if getattr(self.config, "dynamic_position_sizing", True):
+                        pos_size = self.calculate_dynamic_position_size(
+                            token=token,
+                            connector_1=connector_1,
+                            connector_2=connector_2,
+                            trade_side=trade_side,
+                            max_target_size=self.config.position_size_quote,
+                        )
+
                     current_profitability = self.get_current_profitability_after_fees(
-                        token, connector_1, connector_2, trade_side
+                        token, connector_1, connector_2, trade_side, quote_volume=pos_size
                     )
+
+                    # Mode 1: Payback Period Barrier (回本周期硬性拦截)
+                    hourly_yield = expected_profitability / Decimal("24")
+                    if current_profitability < 0:
+                        friction_pct = -current_profitability
+                        payback_hours = (friction_pct / hourly_yield) if hourly_yield > 0 else Decimal("999999")
+                    else:
+                        friction_pct = Decimal("0")
+                        payback_hours = Decimal("0")
+
+                    max_allowed_payback = Decimal(str(getattr(self.config, "max_payback_hours", Decimal("12.0"))))
+                    if payback_hours > max_allowed_payback:
+                        self.logger().info(
+                            f"[PAYBACK-BARRIER] Token {token} entry friction {float(friction_pct):.3%} requires "
+                            f"{float(payback_hours):.1f}h of funding to breakeven (limit: {float(max_allowed_payback):.1f}h). "
+                            f"Skipping entry to protect capital from excessive spread."
+                        )
+                        continue
+
                     if self.config.trade_profitability_condition_to_enter:
                         if current_profitability < 0:
                             self.logger().info(
@@ -766,18 +806,9 @@ class FundingRateArbitrage(StrategyV2Base):
                     self.logger().info(
                         f"Best Combination: {connector_1} | {connector_2} | {trade_side} "
                         f"Funding rate profitability: {expected_profitability:.4%} "
-                        f"Trading profitability after fees: {current_profitability:.4%}"
+                        f"Trading profitability after fees: {current_profitability:.4%} "
+                        f"Payback: {float(payback_hours):.1f}h (Limit: {float(max_allowed_payback):.1f}h)"
                     )
-
-                    pos_size = self.config.position_size_quote
-                    if getattr(self.config, "dynamic_position_sizing", True):
-                        pos_size = self.calculate_dynamic_position_size(
-                            token=token,
-                            connector_1=connector_1,
-                            connector_2=connector_2,
-                            trade_side=trade_side,
-                            max_target_size=self.config.position_size_quote,
-                        )
 
                     if self.config.dry_run:
                         # Open Virtual Position in Sandbox
@@ -830,6 +861,8 @@ class FundingRateArbitrage(StrategyV2Base):
                             "entry_fee_quote": (fee_pct_1 + fee_pct_2) * pos_size,
                             "expected_profitability": expected_profitability,
                             "entry_profitability_after_fees": current_profitability,
+                            "payback_hours": float(payback_hours),
+                            "entry_friction_pct": float(friction_pct),
                             "funding_payments": [],
                             "next_funding_time_1": funding_info_report[connector_1].next_funding_utc_timestamp,
                             "next_funding_time_2": funding_info_report[connector_2].next_funding_utc_timestamp,
