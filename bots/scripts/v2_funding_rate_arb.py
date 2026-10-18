@@ -425,6 +425,8 @@ class FundingRateArbitrage(StrategyV2Base):
                 f_pnl = Decimal(str(pos.get("funding_pnl", 0)))
                 tot_pnl = Decimal(str(pos.get("total_net_pnl", t_pnl + f_pnl)))
                 total_realized_pnl += tot_pnl
+                p_size = Decimal(str(pos.get("position_size_quote", self.config.position_size_quote)))
+                total_volume += p_size * 4  # 2 legs entered + 2 legs closed
                 reason = pos.get("close_reason", "Completed")
                 if "Take Profit" in reason:
                     tp_count += 1
@@ -440,6 +442,7 @@ class FundingRateArbitrage(StrategyV2Base):
                     "trading_pnl": float(t_pnl),
                     "funding_pnl": float(f_pnl),
                     "total_net_pnl": float(tot_pnl),
+                    "position_size": float(p_size),
                     "leverage": int(self.config.leverage),
                 })
 
@@ -507,8 +510,10 @@ class FundingRateArbitrage(StrategyV2Base):
                 data_dir = getattr(cfg, "data_file_path", None) if cfg else None
             if data_dir and os.path.isdir(data_dir):
                 json_path = os.path.join(data_dir, "arbitrage_trades.json")
+                dump_data = report["funding_rate_arb"]["custom_info"].copy()
+                dump_data["performance"] = report["funding_rate_arb"]["performance"]
                 with open(json_path, "w") as f:
-                    json.dump(report["funding_rate_arb"]["custom_info"], f, indent=2)
+                    json.dump(dump_data, f, indent=2)
         except Exception as e:
             self.logger().debug(f"Failed to persist arbitrage_trades.json: {e}")
 
