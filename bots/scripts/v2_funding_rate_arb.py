@@ -92,6 +92,13 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": True,
         }
     )
+    liquidation_buffer_pct: Decimal = Field(
+        default=Decimal("0.08"),
+        json_schema_extra={
+            "prompt": lambda mi: "Safety distance threshold to liquidation price for defense exit (e.g. 0.08 for 8%): ",
+            "prompt_on_new": True,
+        }
+    )
 
     @field_validator("connectors", "tokens", mode="before")
     @classmethod
@@ -313,6 +320,26 @@ class FundingRateArbitrage(StrategyV2Base):
             net_position_pnl = unrealized_trading_pnl + funding_income
             elapsed_sec = max(0, now - arb.get("open_timestamp", now))
 
+            # Calculate estimated liquidation price and safety margin distance
+            lev = Decimal(str(getattr(self.config, "leverage", 3)))
+            mmr = Decimal("0.02")  # ~2% maintenance margin ratio
+            p1_open_val = Decimal(str(arb.get("price_1", p1_curr)))
+            p2_open_val = Decimal(str(arb.get("price_2", p2_curr)))
+            is_buy_side = (arb["side"] == TradeType.BUY) if isinstance(arb["side"], TradeType) else (str(arb["side"]) in ["BUY", "TradeType.BUY"])
+
+            if is_buy_side:
+                liq_p1 = max(Decimal("0"), p1_open_val * (Decimal("1") - Decimal("1") / lev + mmr))
+                dist1_pct = (p1_curr - liq_p1) / p1_curr if p1_curr > 0 else Decimal("1")
+                liq_p2 = p2_open_val * (Decimal("1") + Decimal("1") / lev - mmr)
+                dist2_pct = (liq_p2 - p2_curr) / p2_curr if p2_curr > 0 else Decimal("1")
+            else:
+                liq_p1 = p1_open_val * (Decimal("1") + Decimal("1") / lev - mmr)
+                dist1_pct = (liq_p1 - p1_curr) / p1_curr if p1_curr > 0 else Decimal("1")
+                liq_p2 = max(Decimal("0"), p2_open_val * (Decimal("1") - Decimal("1") / lev + mmr))
+                dist2_pct = (p2_curr - liq_p2) / p2_curr if p2_curr > 0 else Decimal("1")
+
+            min_dist_pct = min(dist1_pct, dist2_pct)
+
             active_list.append({
                 "token": token,
                 "connector_1": arb["connector_1"],
@@ -322,6 +349,11 @@ class FundingRateArbitrage(StrategyV2Base):
                 "entry_price_2": float(arb.get("price_2", 0)),
                 "current_price_1": float(p1_curr),
                 "current_price_2": float(p2_curr),
+                "liq_price_1": float(liq_p1),
+                "liq_price_2": float(liq_p2),
+                "liq_distance_1_pct": float(dist1_pct),
+                "liq_distance_2_pct": float(dist2_pct),
+                "min_liq_distance_pct": float(min_dist_pct),
                 "position_size": float(pos_size),
                 "funding_income": float(funding_income),
                 "settlement_count": len(arb.get("funding_payments", [])),
@@ -852,8 +884,32 @@ class FundingRateArbitrage(StrategyV2Base):
                     stop_loss_target = Decimal(str(self.config.funding_rate_diff_stop_loss))
                     current_funding_condition = (not diff_val.is_nan()) and (diff_val < stop_loss_target)
 
-                    if take_profit_condition or current_funding_condition:
-                        reason = "Take Profit" if take_profit_condition else "Stop Loss"
+                    # Liquidation Defense check
+                    lev = Decimal(str(getattr(self.config, "leverage", 3)))
+                    mmr = Decimal("0.02")
+                    is_buy_side = (funding_arbitrage_info["side"] == TradeType.BUY) if isinstance(funding_arbitrage_info["side"], TradeType) else (str(funding_arbitrage_info["side"]) in ["BUY", "TradeType.BUY"])
+                    if is_buy_side:
+                        liq_p1 = max(Decimal("0"), p1_open * (Decimal("1") - Decimal("1") / lev + mmr))
+                        dist1_pct = (p1_curr - liq_p1) / p1_curr if p1_curr > 0 else Decimal("1")
+                        liq_p2 = p2_open * (Decimal("1") + Decimal("1") / lev - mmr)
+                        dist2_pct = (liq_p2 - p2_curr) / p2_curr if p2_curr > 0 else Decimal("1")
+                    else:
+                        liq_p1 = p1_open * (Decimal("1") + Decimal("1") / lev - mmr)
+                        dist1_pct = (liq_p1 - p1_curr) / p1_curr if p1_curr > 0 else Decimal("1")
+                        liq_p2 = max(Decimal("0"), p2_open * (Decimal("1") - Decimal("1") / lev + mmr))
+                        dist2_pct = (p2_curr - liq_p2) / p2_curr if p2_curr > 0 else Decimal("1")
+
+                    min_dist_pct = min(dist1_pct, dist2_pct)
+                    liq_buffer = Decimal(str(getattr(self.config, "liquidation_buffer_pct", 0.08)))
+                    liq_defense_condition = (min_dist_pct <= liq_buffer)
+
+                    if take_profit_condition or current_funding_condition or liq_defense_condition:
+                        if liq_defense_condition:
+                            reason = f"Liquidation Defense (Safety Margin {float(min_dist_pct):.1%} <= {float(liq_buffer):.1%})"
+                        elif take_profit_condition:
+                            reason = "Take Profit"
+                        else:
+                            reason = "Stop Loss"
                         self.logger().info(
                             f"[DRY-RUN] Virtual Arbitrage Closed ({reason}) for {token}!\n"
                             f"  Trading PnL: {trading_pnl:+.4f}, Funding PnL: {funding_pnl:+.4f}, Total Net PnL: {total_net_pnl:+.4f} ({total_pnl_pct:+.2%})"
@@ -892,6 +948,10 @@ class FundingRateArbitrage(StrategyV2Base):
                         stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
                     elif current_funding_condition:
                         self.logger().info("Funding rate difference reached for stop loss, stopping executors")
+                        self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
+                        stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
+                    elif liq_defense_condition:
+                        self.logger().info(f"Liquidation safety distance reached ({float(min_dist_pct):.1%}), stopping executors for defense")
                         self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
                         stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
                 except Exception as e:
