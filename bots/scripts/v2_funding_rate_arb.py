@@ -354,6 +354,9 @@ class FundingRateArbitrage(StrategyV2Base):
                 "liq_distance_1_pct": float(dist1_pct),
                 "liq_distance_2_pct": float(dist2_pct),
                 "min_liq_distance_pct": float(min_dist_pct),
+                "leverage": int(lev),
+                "long_leverage": int(lev),
+                "short_leverage": int(lev),
                 "position_size": float(pos_size),
                 "funding_income": float(funding_income),
                 "settlement_count": len(arb.get("funding_payments", [])),
@@ -392,6 +395,7 @@ class FundingRateArbitrage(StrategyV2Base):
                     "trading_pnl": float(t_pnl),
                     "funding_pnl": float(f_pnl),
                     "total_net_pnl": float(tot_pnl),
+                    "leverage": int(self.config.leverage),
                 })
 
         # Live Market Comparison across watched tokens
@@ -432,6 +436,7 @@ class FundingRateArbitrage(StrategyV2Base):
                 },
                 "custom_info": {
                     "is_dry_run": bool(self.config.dry_run),
+                    "leverage": int(self.config.leverage),
                     "min_funding_rate_profitability": float(self.config.min_funding_rate_profitability),
                     "min_funding_rate_profitability_pct": float(self.config.min_funding_rate_profitability * 100),
                     "active_positions": active_list,
