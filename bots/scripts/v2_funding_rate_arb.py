@@ -360,6 +360,7 @@ class FundingRateArbitrage(StrategyV2Base):
                 "position_size": float(pos_size),
                 "funding_income": float(funding_income),
                 "settlement_count": len(arb.get("funding_payments", [])),
+                "funding_payments": arb.get("funding_payments", []),
                 "unrealized_trading_pnl": float(unrealized_trading_pnl),
                 "net_pnl": float(net_position_pnl),
                 "net_pnl_pct": float(net_position_pnl / pos_size) if pos_size else 0.0,
