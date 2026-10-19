@@ -280,6 +280,28 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
         json_schema_extra={"prompt": lambda mi: "Cumulative historical net loss threshold to permanently blacklist toxic token (e.g. 30.0 for $30): ", "prompt_on_new": False}
     )
 
+    # --- v1.5.0 Asset Graduation & Rehabilitation Engine Fields ---
+    asset_graduation_enabled: bool = Field(
+        default=True,
+        json_schema_extra={"prompt": lambda mi: "Enable periodic asset graduation review for blacklisted tokens? (True/False): ", "prompt_on_new": False}
+    )
+    asset_graduation_interval_days: float = Field(
+        default=7.0,
+        json_schema_extra={"prompt": lambda mi: "Days interval between asset graduation reviews (e.g. 7.0): ", "prompt_on_new": False}
+    )
+    graduation_min_volume_24h_usd: float = Field(
+        default=30000000.0,
+        json_schema_extra={"prompt": lambda mi: "Min 24h volume across Binance & HL to qualify for graduation (e.g. 30000000.0 for $30M): ", "prompt_on_new": False}
+    )
+    graduation_max_price_divergence: float = Field(
+        default=0.005,
+        json_schema_extra={"prompt": lambda mi: "Max mark price divergence allowed for graduating token (e.g. 0.005 for 0.5%): ", "prompt_on_new": False}
+    )
+    graduation_probe_size_quote: Decimal = Field(
+        default=Decimal("200.0"),
+        json_schema_extra={"prompt": lambda mi: "Probe trade size in USD for probationary tokens (e.g. 200.0 for $200): ", "prompt_on_new": False}
+    )
+
     @field_validator("connectors", "tokens", "tier_1_tokens", "tier_2_tokens", mode="before")
     @classmethod
     def validate_sets(cls, v):
@@ -529,6 +551,10 @@ class FundingRateArbitrage(StrategyV2Base):
         # v1.4.0 Institutional Risk & Profit Overhaul State
         self.token_post_tp_lockout: Dict[str, float] = {}   # token -> timestamp until which entries are locked post-TP
         self.token_permanent_blacklist: Set[str] = set()     # tokens permanently banned due to cumulative deficit
+        # v1.5.0 Asset Graduation & Rehabilitation Engine State
+        self.probationary_tokens: Dict[str, Dict] = {}      # token -> {"admitted_ts": float, "probe_size": float, "status": str, "reason": str}
+        self._last_graduation_check_ts: float = 0.0
+        self.is_evaluating_graduation: bool = False
 
     def get_token_tier(self, token: str) -> Tuple[int, Decimal]:
         """
@@ -710,6 +736,15 @@ class FundingRateArbitrage(StrategyV2Base):
                 for b_tok in saved_info.get("permanent_blacklist", []):
                     self.token_permanent_blacklist.add(b_tok)
 
+                # Restore probationary tokens (特赦考察期名单)
+                for pr_tok, pr_data in saved_info.get("probationary_tokens", {}).items():
+                    self.probationary_tokens[pr_tok] = pr_data
+                    self.token_permanent_blacklist.discard(pr_tok)
+                    self.logger().info(
+                        f"🟡 [PROBATION-REHYDRATE] Restored token '{pr_tok}' under graduation probation "
+                        f"(Probe Size: ${pr_data.get('probe_size', 200.0):,.0f})."
+                    )
+
                 # Also restore any directly quarantined tokens from json if saved
                 for q_tok, q_data in saved_info.get("quarantined_tokens", {}).items():
                     if q_data.get("quarantine_until", 0) > now_ts:
@@ -755,9 +790,10 @@ class FundingRateArbitrage(StrategyV2Base):
 
     def on_tick(self):
         if self.ready_to_trade and self.market_data_provider.ready and not getattr(self, "_is_stop_triggered", False):
-            # v1.3.0 Strategy Commands Listener & Auto-Rotation
+            # v1.3.0 Strategy Commands Listener & Auto-Rotation & Asset Graduation
             self.check_strategy_commands()
             self.check_universe_auto_rotation()
+            self.check_asset_graduation()
 
             actions = self.determine_executor_actions()
             for action in actions:
@@ -827,6 +863,9 @@ class FundingRateArbitrage(StrategyV2Base):
                         if t in self.token_quarantine_ledger:
                             del self.token_quarantine_ledger[t]
                             self.logger().info(f"[COMMAND] Cleared quarantine ledger for {t}.")
+                elif act == "trigger_graduation_audit":
+                    self.logger().info("[COMMAND] Manual graduation audit requested from Dashboard.")
+                    asyncio.create_task(self.async_run_asset_graduation(force=True))
             except Exception as e:
                 self.logger().warning(f"[COMMAND] Failed processing strategy command: {e}")
 
@@ -1095,6 +1134,7 @@ class FundingRateArbitrage(StrategyV2Base):
             for c, h in hl_rates.items():
                 if c in bn_rates and c in bn_tickers:
                     b = bn_rates[c]
+                    b_vol = bn_tickers[c]
                     # Enforce strict 1.5% max price divergence to prevent entry friction trap and illiquid tokens
                     if b["price"] > 0 and abs(h["price"] - b["price"]) / b["price"] <= 0.015:
                         if b_vol >= min_vol and h["vol_usd"] >= 500000.0:
@@ -1112,6 +1152,195 @@ class FundingRateArbitrage(StrategyV2Base):
         except Exception as e:
             self.logger().debug(f"[AUTO-ROTATION] Scanner fetch failed: {e}")
             return []
+
+    # --- v1.5.0 Asset Graduation & Rehabilitation Engine ---
+    def check_asset_graduation(self):
+        """
+        Periodically evaluate blacklisted tokens for asset graduation eligibility.
+        """
+        if not getattr(self.config, "asset_graduation_enabled", True):
+            return
+        if getattr(self, "is_evaluating_graduation", False):
+            return
+        now = self.current_timestamp
+        interval_sec = float(getattr(self.config, "asset_graduation_interval_days", 7.0)) * 86400.0
+        if not hasattr(self, "_last_graduation_check_ts") or self._last_graduation_check_ts == 0.0:
+            # On startup, check after 120s if blacklisted tokens exist
+            self._last_graduation_check_ts = now - interval_sec + 120.0
+        if now - self._last_graduation_check_ts >= interval_sec:
+            self._last_graduation_check_ts = now
+            asyncio.create_task(self.async_run_asset_graduation(force=False))
+
+    async def async_run_asset_graduation(self, force: bool = False):
+        """
+        Conduct liquidity & depth review on blacklisted tokens to assess graduation eligibility.
+        Tokens meeting $30M+ volume and <=0.5% price divergence enter probationary probe testing.
+        """
+        if getattr(self, "is_evaluating_graduation", False):
+            self.logger().info("[ASSET-GRADUATION] Graduation audit already running. Skipping duplicate call.")
+            return
+        self.is_evaluating_graduation = True
+        try:
+            candidates = list(self.token_permanent_blacklist)
+            if not candidates:
+                self.logger().info("[ASSET-GRADUATION] Permanent blacklist is empty. No candidates for graduation review.")
+                return
+
+            self.logger().info(f"[ASSET-GRADUATION] Starting graduation audit for {len(candidates)} blacklisted tokens: {candidates} (force={force})...")
+
+            # Fetch market metrics across Binance and Hyperliquid
+            metrics = await asyncio.to_thread(self._fetch_tokens_market_metrics, candidates)
+
+            min_vol = float(getattr(self.config, "graduation_min_volume_24h_usd", 30000000.0))
+            max_div = float(getattr(self.config, "graduation_max_price_divergence", 0.005))
+            probe_size = float(getattr(self.config, "graduation_probe_size_quote", Decimal("200.0")))
+
+            graduated_tokens = []
+            for tok in candidates:
+                data = metrics.get(tok)
+                if not data:
+                    self.logger().info(f"[ASSET-GRADUATION] Token '{tok}' not found on both Binance & Hyperliquid. Audit failed.")
+                    continue
+
+                b_vol = data.get("bn_vol", 0.0)
+                h_vol = data.get("hl_vol", 0.0)
+                total_vol = b_vol + h_vol
+                div_pct = data.get("divergence", 1.0)
+
+                has_vol = (total_vol >= min_vol)
+                has_tight_div = (div_pct <= max_div)
+
+                if has_vol and has_tight_div:
+                    # Grant Probationary Testing Status!
+                    self.token_permanent_blacklist.discard(tok)
+                    self.token_quarantine_ledger.pop(tok, None)
+                    self.probationary_tokens[tok] = {
+                        "admitted_ts": int(self.current_timestamp),
+                        "probe_size": probe_size,
+                        "status": "PROBATIONARY_TESTING",
+                        "reason": f"Matured: Vol ${total_vol/1e6:.1f}M >= ${min_vol/1e6:.1f}M, Div {div_pct:.3%} <= {max_div:.3%}",
+                        "bn_vol": b_vol,
+                        "hl_vol": h_vol,
+                        "divergence": div_pct,
+                        "probe_executed": False,
+                    }
+                    graduated_tokens.append(tok)
+                    self.logger().warning(
+                        f"🎓 [ASSET-GRADUATION-ADMIT] Token '{tok}' PASSED graduation review!\n"
+                        f"  Metrics: Total 24h Vol=${total_vol/1e6:.2f}M (BN:${b_vol/1e6:.1f}M, HL:${h_vol/1e6:.1f}M) >= ${min_vol/1e6:.1f}M | Divergence={div_pct:.3%} <= {max_div:.3%}\n"
+                        f"  Status: Admitted to Probationary Testing (Probe Size: ${probe_size:,.0f} @ 1x Leverage)."
+                    )
+                    # Mount token dynamically to strategy watchlist so it can be monitored
+                    await self.async_add_token(tok)
+                else:
+                    self.logger().info(
+                        f"[ASSET-GRADUATION-FAIL] Token '{tok}' failed graduation audit: "
+                        f"Total Vol=${total_vol/1e6:.2f}M (Req >=${min_vol/1e6:.1f}M), "
+                        f"Divergence={div_pct:.3%} (Req <={max_div:.3%}). Remains blacklisted."
+                    )
+
+            if graduated_tokens:
+                self.logger().info(f"🎓 [ASSET-GRADUATION] Audit complete. Tokens admitted to probation: {graduated_tokens}")
+            else:
+                self.logger().info("[ASSET-GRADUATION] Audit complete. No tokens met the strict graduation criteria.")
+        except Exception as e:
+            self.logger().warning(f"[ASSET-GRADUATION] Error during graduation audit: {e}", exc_info=True)
+        finally:
+            self.is_evaluating_graduation = False
+
+    def _fetch_tokens_market_metrics(self, tokens: List[str]) -> Dict[str, Dict]:
+        """
+        Fetch 24h volume and mark prices for specific candidate tokens across Binance and Hyperliquid.
+        """
+        metrics = {}
+        try:
+            # 1. Binance Ticker 24hr & PremiumIndex
+            t_req = urllib.request.Request("https://fapi.binance.com/fapi/v1/ticker/24hr", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(t_req, timeout=8) as r:
+                bn_tickers = {x["symbol"][:-4]: float(x.get("quoteVolume", 0)) for x in json.loads(r.read()) if x.get("symbol", "").endswith("USDT")}
+
+            p_req = urllib.request.Request("https://fapi.binance.com/fapi/v1/premiumIndex", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(p_req, timeout=8) as r:
+                bn_rates = {x["symbol"][:-4]: float(x.get("markPrice", 0)) for x in json.loads(r.read()) if x.get("symbol", "").endswith("USDT")}
+
+            # 2. Hyperliquid metaAndAssetCtxs
+            hl_req = urllib.request.Request(
+                "https://api.hyperliquid.xyz/info",
+                data=json.dumps({"type": "metaAndAssetCtxs"}).encode(),
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(hl_req, timeout=8) as r:
+                hl_data = json.loads(r.read())
+                universe = hl_data[0].get("universe", [])
+                ctxs = hl_data[1] if len(hl_data) > 1 else []
+                hl_info = {}
+                for m, c in zip(universe, ctxs):
+                    coin = m.get("name")
+                    if coin:
+                        hl_info[coin] = {
+                            "price": float(c.get("markPx", 0)),
+                            "vol_usd": float(c.get("dayNtlVlm", 0))
+                        }
+
+            for tok in tokens:
+                canon = self.get_canonical_token(tok).upper()
+                bn_sym = self.get_exchange_symbol(canon, "binance_perpetual").replace("-USDT", "").replace("USDT", "")
+                hl_sym = self.get_exchange_symbol(canon, "hyperliquid_perpetual").replace("-USDT", "").replace("USDT", "")
+
+                b_vol = bn_tickers.get(bn_sym, bn_tickers.get(canon, 0.0))
+                b_p = bn_rates.get(bn_sym, bn_rates.get(canon, 0.0))
+
+                hl_item = hl_info.get(hl_sym, hl_info.get(canon))
+                if hl_item and b_p > 0:
+                    h_p = hl_item["price"]
+                    h_vol = hl_item["vol_usd"]
+                    # Apply multiplier normalization if necessary
+                    m_bn = float(self.get_token_multiplier(canon, "binance_perpetual"))
+                    m_hl = float(self.get_token_multiplier(canon, "hyperliquid_perpetual"))
+                    norm_b_p = b_p / m_bn if m_bn > 0 else b_p
+                    norm_h_p = h_p / m_hl if m_hl > 0 else h_p
+                    div_pct = abs(norm_h_p - norm_b_p) / norm_b_p if norm_b_p > 0 else 1.0
+
+                    metrics[tok] = {
+                        "bn_vol": b_vol,
+                        "hl_vol": h_vol,
+                        "divergence": div_pct,
+                        "bn_price": norm_b_p,
+                        "hl_price": norm_h_p,
+                    }
+        except Exception as e:
+            self.logger().debug(f"[ASSET-GRADUATION] Failed fetching market metrics: {e}")
+        return metrics
+
+    def _handle_probation_result(self, token: str, net_pnl: float, close_reason: str):
+        """
+        Process probationary testing outcome upon position closure:
+        1. If net PnL is positive or Take Profit / Breakeven triggered -> Full Graduation!
+        2. If net PnL is negative -> Return to Permanent Blacklist!
+        """
+        if token in self.probationary_tokens:
+            is_success = (net_pnl >= 0) or ("Take Profit" in close_reason) or ("Breakeven" in close_reason)
+            del self.probationary_tokens[token]
+            if is_success:
+                self.token_permanent_blacklist.discard(token)
+                self.token_quarantine_ledger.pop(token, None)
+                self.logger().warning(
+                    f"🎓 [ASSET-GRADUATION-SUCCESS] Token '{token}' successfully completed probationary probe test "
+                    f"with Net PnL ${net_pnl:+.4f} ({close_reason})! Formally graduated back to normal asset universe!"
+                )
+            else:
+                self.token_permanent_blacklist.add(token)
+                self.token_quarantine_ledger[token] = {
+                    "quarantine_until": self.current_timestamp + 86400 * 3650,
+                    "reason": f"Probation Failed: Net Loss (${net_pnl:.2f})",
+                    "consecutive_losses": 1,
+                    "loss_amount": net_pnl,
+                    "triggered_at": self.current_timestamp,
+                }
+                self.logger().warning(
+                    f"🚫 [ASSET-PROBATION-FAILED] Token '{token}' failed probationary probe trial "
+                    f"with loss ${net_pnl:+.4f} ({close_reason}). Re-assigned to permanent toxic blacklist."
+                )
 
     def publish_arbitrage_performance(self):
         """
@@ -1229,6 +1458,7 @@ class FundingRateArbitrage(StrategyV2Base):
                 "entry_spread_pct": float(arb.get("entry_profitability_after_fees", 0.0)),
                 "next_funding_1": int(arb.get("next_funding_time_1", 0)),
                 "next_funding_2": int(arb.get("next_funding_time_2", 0)),
+                "is_probationary_probe": bool(arb.get("is_probationary_probe", False)),
             })
 
         # Closed trades
@@ -1339,6 +1569,27 @@ class FundingRateArbitrage(StrategyV2Base):
                         "min_apr_threshold": float(getattr(self.config, "auto_rotation_min_apr", 0.35)),
                         "min_apr_delta": float(getattr(self.config, "auto_rotation_min_apr_delta", 0.40)),
                         "rotation_events": getattr(self, "rotation_event_history", [])[:15],
+                    },
+                    "probationary_tokens": {
+                        tok: {
+                            "admitted_ts": int(p_data.get("admitted_ts", 0)),
+                            "probe_size": float(p_data.get("probe_size", 200.0)),
+                            "status": str(p_data.get("status", "PROBATIONARY_TESTING")),
+                            "reason": str(p_data.get("reason", "")),
+                            "probe_executed": bool(p_data.get("probe_executed", False)),
+                            "bn_vol": float(p_data.get("bn_vol", 0.0)),
+                            "hl_vol": float(p_data.get("hl_vol", 0.0)),
+                            "divergence": float(p_data.get("divergence", 0.0)),
+                        } for tok, p_data in self.probationary_tokens.items()
+                    },
+                    "graduation_status": {
+                        "asset_graduation_enabled": bool(getattr(self.config, "asset_graduation_enabled", True)),
+                        "graduation_interval_days": float(getattr(self.config, "asset_graduation_interval_days", 7.0)),
+                        "last_graduation_check_ts": float(getattr(self, "_last_graduation_check_ts", 0.0)),
+                        "next_graduation_check_ts": float(getattr(self, "_last_graduation_check_ts", 0.0) + getattr(self.config, "asset_graduation_interval_days", 7.0) * 86400.0),
+                        "graduation_min_volume_24h_usd": float(getattr(self.config, "graduation_min_volume_24h_usd", 30000000.0)),
+                        "graduation_max_price_divergence": float(getattr(self.config, "graduation_max_price_divergence", 0.005)),
+                        "graduation_probe_size_quote": float(getattr(self.config, "graduation_probe_size_quote", Decimal("200.0"))),
                     },
                 }
             }
@@ -1623,7 +1874,7 @@ class FundingRateArbitrage(StrategyV2Base):
         for token in self.config.tokens:
             if token not in self.active_funding_arbitrages:
                 # 0. Permanent Blacklist Check (毒币终生累计亏损熔断)
-                if token in self.token_permanent_blacklist:
+                if token in self.token_permanent_blacklist and token not in self.probationary_tokens:
                     self.logger().debug(
                         f"[BLACKLIST-SKIP] Token '{token}' is permanently blacklisted due to severe cumulative historical loss. Skipping entry."
                     )
@@ -1697,15 +1948,23 @@ class FundingRateArbitrage(StrategyV2Base):
                     continue
 
                 # Dynamically size position first to reflect real orderbook capacity
-                pos_size = self.config.position_size_quote
-                if getattr(self.config, "dynamic_position_sizing", True):
-                    pos_size = self.calculate_dynamic_position_size(
-                        token=token,
-                        connector_1=connector_1,
-                        connector_2=connector_2,
-                        trade_side=trade_side,
-                        max_target_size=self.config.position_size_quote,
+                is_probationary = token in self.probationary_tokens
+                if is_probationary:
+                    pos_size = Decimal(str(getattr(self.config, "graduation_probe_size_quote", Decimal("200.0"))))
+                    self.logger().info(
+                        f"🔬 [PROBATION-SIZING] Token '{token}' is under probationary testing. "
+                        f"Restricting position size to probe size ${float(pos_size):,.0f} at 1x leverage."
                     )
+                else:
+                    pos_size = self.config.position_size_quote
+                    if getattr(self.config, "dynamic_position_sizing", True):
+                        pos_size = self.calculate_dynamic_position_size(
+                            token=token,
+                            connector_1=connector_1,
+                            connector_2=connector_2,
+                            trade_side=trade_side,
+                            max_target_size=self.config.position_size_quote,
+                        )
 
                 current_profitability = self.get_current_profitability_after_fees(
                     token, connector_1, connector_2, trade_side, quote_volume=pos_size
@@ -1829,7 +2088,7 @@ class FundingRateArbitrage(StrategyV2Base):
                         position_action=PositionAction.OPEN
                     ).percent
 
-                    eff_lev = self.get_effective_leverage(token, pos_size)
+                    eff_lev = Decimal("1") if is_probationary else self.get_effective_leverage(token, pos_size)
                     self.active_funding_arbitrages[token] = {
                         "is_virtual": True,
                         "connector_1": connector_1,
@@ -1843,6 +2102,7 @@ class FundingRateArbitrage(StrategyV2Base):
                         "position_size_quote": pos_size,
                         "tier": int(self.get_token_tier(token)[0]),
                         "leverage": eff_lev,
+                        "is_probationary_probe": is_probationary,
                         "entry_fee_quote": (fee_pct_1 + fee_pct_2) * pos_size,
                         "expected_profitability": expected_profitability,
                         "entry_profitability_after_fees": current_profitability,
@@ -1853,17 +2113,19 @@ class FundingRateArbitrage(StrategyV2Base):
                         "next_funding_time_2": funding_info_report[connector_2].next_funding_utc_timestamp,
                         "executors_ids": ["DRY_RUN_SANDBOX"],
                     }
+                    if is_probationary and token in self.probationary_tokens:
+                        self.probationary_tokens[token]["probe_executed"] = True
                     self.entry_candidate_ticks.pop(token, None)
                     self.logger().info(
                         f"[DRY-RUN] Virtual Arbitrage Position Established for {token}!\n"
                         f"  Leg 1 ({connector_1}): {'BUY' if trade_side == TradeType.BUY else 'SELL'} @ {p1:.4f}\n"
                         f"  Leg 2 ({connector_2}): {'SELL' if trade_side == TradeType.BUY else 'BUY'} @ {p2:.4f}\n"
-                        f"  Notional Size: ${float(pos_size):,.2f} | Leverage: {eff_lev}x ({'Zero-Leverage Safe' if eff_lev == 1 else 'Capital Boost'})\n"
+                        f"  Notional Size: ${float(pos_size):,.2f} | Leverage: {eff_lev}x ({'Zero-Leverage Safe Probe' if eff_lev == 1 else 'Capital Boost'})\n"
                         f"  Daily Rate Diff: {expected_profitability:.4%}, Net Entry Spread: {current_profitability:.4%}"
                     )
                 else:
                     # Real Live Trading Executors
-                    eff_lev = self.get_effective_leverage(token, pos_size)
+                    eff_lev = Decimal("1") if is_probationary else self.get_effective_leverage(token, pos_size)
                     self.logger().info(f"Starting live executors for {token} with dynamic size ${float(pos_size):,.2f} (Leverage: {eff_lev}x)...")
                     position_executor_config_1, position_executor_config_2 = self.get_position_executors_config(
                         token, connector_1, connector_2, trade_side, position_size_quote=pos_size
@@ -1882,10 +2144,13 @@ class FundingRateArbitrage(StrategyV2Base):
                         "position_size_quote": pos_size,
                         "tier": int(self.get_token_tier(token)[0]),
                         "leverage": eff_lev,
+                        "is_probationary_probe": is_probationary,
                         "expected_profitability": expected_profitability,
                         "entry_profitability_after_fees": current_profitability,
                         "funding_payments": [],
                     }
+                    if is_probationary and token in self.probationary_tokens:
+                        self.probationary_tokens[token]["probe_executed"] = True
                     self.entry_candidate_ticks.pop(token, None)
 
                     return [CreateExecutorAction(executor_config=position_executor_config_1),
@@ -2198,7 +2463,10 @@ class FundingRateArbitrage(StrategyV2Base):
                         # Cooldown & Quarantine Ledger
                         self.token_last_closed_timestamp[token] = self.current_timestamp
                         self.inversion_tick_counter[token] = 0
-                        self._evaluate_token_quarantine(token, float(total_net_pnl))
+                        if token in self.probationary_tokens or funding_arbitrage_info.get("is_probationary_probe"):
+                            self._handle_probation_result(token, float(total_net_pnl), reason)
+                        else:
+                            self._evaluate_token_quarantine(token, float(total_net_pnl))
 
                         # Module 1: Post-Take-Profit Anti-Churning Lockout (止盈防高位追高锁定)
                         if "Take Profit" in reason:
@@ -2306,7 +2574,10 @@ class FundingRateArbitrage(StrategyV2Base):
                         # Cooldown & Quarantine Ledger
                         self.token_last_closed_timestamp[token] = self.current_timestamp
                         self.inversion_tick_counter[token] = 0
-                        self._evaluate_token_quarantine(token, float(total_net_pnl))
+                        if token in self.probationary_tokens or funding_arbitrage_info.get("is_probationary_probe"):
+                            self._handle_probation_result(token, float(total_net_pnl), reason)
+                        else:
+                            self._evaluate_token_quarantine(token, float(total_net_pnl))
 
                         # Module 1: Post-Take-Profit Anti-Churning Lockout (止盈防高位追高锁定)
                         if "Take Profit" in reason:
