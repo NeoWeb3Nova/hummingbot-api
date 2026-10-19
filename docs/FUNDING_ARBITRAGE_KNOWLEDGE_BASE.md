@@ -233,3 +233,6 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
    - 重启容器或触发自动轮动，系统会自动安全平仓旧币并入账历史账本。
 3. **资金安全与异常处置**：
    - 若某标的强平垫接近 10%，策略将自动平仓退出；人工无需恐慌，检查历史平仓原因即可确认。
+4. **VPS 实盘生产部署与安全自检**：
+   - 生产环境迁移务必遵循亚太低延迟选址、Chrony 时钟毫秒同步、Tailscale 零暴露、API Key 固定 IP 白名单与 Docker 日志防爆等 6 大核心防线，详见专题指南 [`docs/VPS_PRODUCTION_DEPLOYMENT_GUIDE.md`](file:///home/neo/projects/hummingbot/docs/VPS_PRODUCTION_DEPLOYMENT_GUIDE.md)。
+
