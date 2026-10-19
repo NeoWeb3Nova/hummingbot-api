@@ -113,6 +113,14 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": False,
         }
     )
+    max_allowed_price_divergence: Decimal = Field(
+        default=Decimal("0.03"),
+        json_schema_extra={
+            "prompt": lambda mi: "Max allowed cross-exchange price divergence to prevent ticker collisions (e.g. 0.03 for 3%): ",
+            "prompt_on_new": False,
+        }
+    )
+
 
 
     @field_validator("connectors", "tokens", mode="before")
@@ -848,22 +856,37 @@ class FundingRateArbitrage(StrategyV2Base):
                         f"Payback: {float(payback_hours):.1f}h (Limit: {float(max_allowed_payback):.1f}h)"
                     )
 
+                    trading_pair_1 = self.get_trading_pair_for_connector(token, connector_1)
+                    trading_pair_2 = self.get_trading_pair_for_connector(token, connector_2)
+                    p1 = self.get_safe_quote_price(
+                        connector_name=connector_1,
+                        trading_pair=trading_pair_1,
+                        quote_volume=pos_size,
+                        is_buy=trade_side == TradeType.BUY,
+                    )
+                    p2 = self.get_safe_quote_price(
+                        connector_name=connector_2,
+                        trading_pair=trading_pair_2,
+                        quote_volume=pos_size,
+                        is_buy=trade_side != TradeType.BUY,
+                    )
+
+                    # Asset Consistency & Price Divergence Circuit Breaker (同名不同币与假币强熔断防御)
+                    avg_p = (p1 + p2) / Decimal("2")
+                    if avg_p > Decimal("0"):
+                        price_divergence = abs(p1 - p2) / avg_p
+                        max_div = Decimal(str(getattr(self.config, "max_allowed_price_divergence", Decimal("0.03"))))
+                        if price_divergence > max_div:
+                            self.logger().warning(
+                                f"[ASSET-INTEGRITY-REJECT] Token '{token}' cross-exchange price divergence is {float(price_divergence):.2%} "
+                                f"({connector_1}: ${float(p1):.4f} vs {connector_2}: ${float(p2):.4f}), exceeding safe limit of {float(max_div):.1%}!\n"
+                                f"  Suspected homonym ticker collision (同名不同币), 1000x multiplier mismatch, or fake impostor asset. "
+                                f"Entry rejected immediately to protect capital!"
+                            )
+                            continue
+
                     if self.config.dry_run:
                         # Open Virtual Position in Sandbox
-                        trading_pair_1 = self.get_trading_pair_for_connector(token, connector_1)
-                        trading_pair_2 = self.get_trading_pair_for_connector(token, connector_2)
-                        p1 = self.get_safe_quote_price(
-                            connector_name=connector_1,
-                            trading_pair=trading_pair_1,
-                            quote_volume=pos_size,
-                            is_buy=trade_side == TradeType.BUY,
-                        )
-                        p2 = self.get_safe_quote_price(
-                            connector_name=connector_2,
-                            trading_pair=trading_pair_2,
-                            quote_volume=pos_size,
-                            is_buy=trade_side != TradeType.BUY,
-                        )
                         fee_pct_1 = self.connectors[connector_1].get_fee(
                             base_currency=trading_pair_1.split("-")[0],
                             quote_currency=trading_pair_1.split("-")[1],
