@@ -194,7 +194,8 @@ flowchart LR
   - **正确的即时校准操作**：
     - 直接重启 timesyncd：`sudo systemctl restart systemd-timesyncd`（此时 timesyncd 会在启动时立即执行一次 step 毫秒级对齐；**切勿在其后执行 `sudo hwclock -s`**；如需将正确时间固化到硬件时钟，应使用 `sudo hwclock -w` 即 `--systohc`）；
   - **生产 VPS 与量化交易终极推荐（Chrony）**：
-    - 在生产或 WSL2 中安装高精度时间守护神 `chrony`（`sudo apt install -y chrony`）。Chrony 默认配置 `makestep 0.1 3`，任何时钟偏差超过 100ms 均会立刻毫秒级跳变对齐，亦可通过 `sudo chronyc makestep` 瞬间强制对齐，是专业量化交易的唯一工业级标配。
+    - 在生产或 WSL2 中安装高精度时间守护神 `chrony`（`sudo apt install -y chrony`）。配置 `makestep 0.1 -1`，任何时钟偏差超过 100ms 均会立刻毫秒级跳变对齐，亦可通过 `sudo chronyc makestep` 瞬间强制对齐；
+    - **⚠️ 警惕 WSL2 专属容器陷阱（`SYNC_IN_CONTAINER`）**：Ubuntu 体系将 WSL2 判定为容器（`systemd-detect-virt --container` 为真）。默认情况下 `/etc/default/chrony` 中的 `SYNC_IN_CONTAINER="no"` 会自动给 `chronyd` 注入 `-x` 参数（禁止调节系统时钟），导致 `chronyc makestep` 抛出 `500 Failure` 且时钟无法更新。必须在 `/etc/default/chrony` 中设置 `SYNC_IN_CONTAINER="yes"` 彻底解除封印。自动化脚本 [`scripts/setup-chrony.sh`](file:///home/neo/projects/hummingbot/scripts/setup-chrony.sh) 已内置该修复。
 
 ### 15. 历史平仓成交全生命周期深度复盘与盈亏四维归因模型（Post-Mortem & Attribution Model）
 - **现象**：以往平仓记录仅有一张简陋数据表，缺乏对交易过程全生命周期的追踪。用户无法直观回答复盘 3 大核心问题：“为什么盈利？”、“为什么亏损？”、“持仓了多久，经历了什么？”。
