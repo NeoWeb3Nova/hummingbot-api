@@ -4,6 +4,7 @@ import math
 import os
 import time
 import urllib.request
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, List, Set, Tuple
 
@@ -180,7 +181,7 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
         }
     )
     settlement_blackout_tier3_only: bool = Field(
-        default=True,
+        default=False,
         json_schema_extra={
             "prompt": lambda mi: "Only apply settlement blackout to Tier 3 tokens? (True/False): ",
             "prompt_on_new": False,
@@ -259,6 +260,24 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
     partial_tp_threshold_pct: Decimal = Field(
         default=Decimal("0.010"),
         json_schema_extra={"prompt": lambda mi: "Net profit threshold on position to trigger tranche 1 (e.g. 0.010 for 1.0%): ", "prompt_on_new": False}
+    )
+
+    # --- v1.4.0 Institutional Risk & Profit Overhaul Fields ---
+    post_tp_cooldown_hours: float = Field(
+        default=4.0,
+        json_schema_extra={"prompt": lambda mi: "Cooldown hours before re-entering a token after take profit (e.g. 4.0): ", "prompt_on_new": False}
+    )
+    breakeven_trailing_activation_pct: Decimal = Field(
+        default=Decimal("0.006"),
+        json_schema_extra={"prompt": lambda mi: "Net profit pct to activate breakeven stop loss (e.g. 0.006 for 0.6%): ", "prompt_on_new": False}
+    )
+    breakeven_trailing_stop_pct: Decimal = Field(
+        default=Decimal("0.0005"),
+        json_schema_extra={"prompt": lambda mi: "Locked breakeven stop loss level after activation (e.g. 0.0005 for +0.05%): ", "prompt_on_new": False}
+    )
+    cumulative_loss_hard_blacklist_usd: float = Field(
+        default=30.0,
+        json_schema_extra={"prompt": lambda mi: "Cumulative historical net loss threshold to permanently blacklist toxic token (e.g. 30.0 for $30): ", "prompt_on_new": False}
     )
 
     @field_validator("connectors", "tokens", "tier_1_tokens", "tier_2_tokens", mode="before")
@@ -507,6 +526,9 @@ class FundingRateArbitrage(StrategyV2Base):
         self._last_rotation_check_ts: float = 0.0
         self._last_cmd_check_ts: float = 0.0
         self.is_rotating: bool = False
+        # v1.4.0 Institutional Risk & Profit Overhaul State
+        self.token_post_tp_lockout: Dict[str, float] = {}   # token -> timestamp until which entries are locked post-TP
+        self.token_permanent_blacklist: Set[str] = set()     # tokens permanently banned due to cumulative deficit
 
     def get_token_tier(self, token: str) -> Tuple[int, Decimal]:
         """
@@ -625,10 +647,11 @@ class FundingRateArbitrage(StrategyV2Base):
                             "executors_ids": ap.get("executors_ids", ["DRY_RUN_SANDBOX"]),
                             "partial_tp_executed": bool(ap.get("partial_tp_executed", False)),
                             "locked_tp_pnl": float(ap.get("locked_tp_pnl", 0.0)),
+                            "breakeven_active": bool(ap.get("breakeven_active", False)),
                         }
                         self.logger().info(
                             f"[REHYDRATE] Restored active position for {t}: "
-                            f"{side_val} | Size: ${float(pos_size):,.2f} | Leverage: {eff_lev}x | Partial TP: {ap.get('partial_tp_executed', False)}"
+                            f"{side_val} | Size: ${float(pos_size):,.2f} | Leverage: {eff_lev}x | Partial TP: {ap.get('partial_tp_executed', False)} | Breakeven: {ap.get('breakeven_active', False)}"
                         )
                 # Rehydrate rotation status history
                 rot_status = saved_info.get("rotation_status", {})
@@ -636,10 +659,31 @@ class FundingRateArbitrage(StrategyV2Base):
                     self.rotation_event_history = rot_status.get("rotation_events", [])
                     self.last_rotation_timestamp = float(rot_status.get("last_rotation_timestamp", 0.0))
                 self.logger().info("[ROTATION] Loaded historical closed trades, rotation events, and rehydrated active positions.")
-                # Auto-initialize quarantine ledger for tokens with heavy historical net deficit
+
+                # Auto-initialize permanent toxic blacklist and quarantine ledger from historical closed trades
+                hard_blacklist_usd = float(getattr(self.config, "cumulative_loss_hard_blacklist_usd", 30.0))
+                loss_thresh = float(getattr(self.config, "single_loss_quarantine_threshold", Decimal("15.0")))
+                quarantine_h = float(getattr(self.config, "token_quarantine_hours", Decimal("24.0")))
+
                 for t_name, t_trades in self.stopped_funding_arbitrages.items():
                     if t_trades:
                         cum_net_pnl = sum(float(p.get("total_net_pnl", 0)) for p in t_trades)
+                        # Module 3: Hard Permanent Blacklist for toxic tokens exceeding cumulative loss threshold
+                        if cum_net_pnl <= -hard_blacklist_usd:
+                            self.token_permanent_blacklist.add(t_name)
+                            self.token_quarantine_ledger[t_name] = {
+                                "quarantine_until": now_ts + 86400 * 3650,  # 10 years (effectively permanent)
+                                "reason": f"Permanent Blacklist: Cumulative Deficit (${cum_net_pnl:.2f} <= -${hard_blacklist_usd:.2f})",
+                                "consecutive_losses": len(t_trades),
+                                "loss_amount": cum_net_pnl,
+                                "triggered_at": now_ts,
+                            }
+                            self.logger().warning(
+                                f"🚫 [PERMANENT-BLACKLIST-INIT] Auto-blacklisted toxic token '{t_name}' "
+                                f"due to severe cumulative historical loss (${cum_net_pnl:.2f} <= -${hard_blacklist_usd:.2f})."
+                            )
+                            continue
+
                         consec_losses = 0
                         for p in reversed(t_trades):
                             if float(p.get("total_net_pnl", 0)) < 0:
@@ -647,8 +691,6 @@ class FundingRateArbitrage(StrategyV2Base):
                             else:
                                 break
                         last_pnl = float(t_trades[-1].get("total_net_pnl", 0))
-                        loss_thresh = float(getattr(self.config, "single_loss_quarantine_threshold", Decimal("15.0")))
-                        quarantine_h = float(getattr(self.config, "token_quarantine_hours", Decimal("24.0")))
 
                         # Only quarantine if token has true net loss deficit AND (last heavy loss or consecutive recent losses)
                         if (last_pnl < -loss_thresh or (consec_losses >= 2 and cum_net_pnl < 0)) and cum_net_pnl < -loss_thresh:
@@ -663,6 +705,11 @@ class FundingRateArbitrage(StrategyV2Base):
                                 f"[QUARANTINE-INIT] Auto-quarantined token '{t_name}' due to heavy historical deficit "
                                 f"(${cum_net_pnl:.2f}) for {quarantine_h:.0f}h."
                             )
+
+                # Restore any saved permanent blacklist
+                for b_tok in saved_info.get("permanent_blacklist", []):
+                    self.token_permanent_blacklist.add(b_tok)
+
                 # Also restore any directly quarantined tokens from json if saved
                 for q_tok, q_data in saved_info.get("quarantined_tokens", {}).items():
                     if q_data.get("quarantine_until", 0) > now_ts:
@@ -771,6 +818,15 @@ class FundingRateArbitrage(StrategyV2Base):
                     if t and t in self.token_quarantine_ledger:
                         del self.token_quarantine_ledger[t]
                         self.logger().info(f"[COMMAND] Cleared quarantine for {t}")
+                elif act == "unblacklist_token":
+                    t = cmd.get("token")
+                    if t:
+                        if t in self.token_permanent_blacklist:
+                            self.token_permanent_blacklist.discard(t)
+                            self.logger().info(f"[COMMAND] Pardoned & removed token {t} from permanent toxic blacklist.")
+                        if t in self.token_quarantine_ledger:
+                            del self.token_quarantine_ledger[t]
+                            self.logger().info(f"[COMMAND] Cleared quarantine ledger for {t}.")
             except Exception as e:
                 self.logger().warning(f"[COMMAND] Failed processing strategy command: {e}")
 
@@ -1157,6 +1213,7 @@ class FundingRateArbitrage(StrategyV2Base):
                 "liquidation_buffer_req_pct": req_buf,
                 "partial_tp_executed": bool(arb.get("partial_tp_executed", False)),
                 "locked_tp_pnl": float(arb.get("locked_tp_pnl", 0.0)),
+                "breakeven_active": bool(arb.get("breakeven_active", False)),
                 "leverage": int(lev),
                 "long_leverage": int(lev),
                 "short_leverage": int(lev),
@@ -1265,6 +1322,14 @@ class FundingRateArbitrage(StrategyV2Base):
                             "consecutive_losses": int(q.get("consecutive_losses", 0)),
                             "loss_amount": float(q.get("loss_amount", 0.0)),
                         } for tok, q in self.token_quarantine_ledger.items() if q.get("quarantine_until", 0) > self.current_timestamp
+                    },
+                    "permanent_blacklist": sorted(list(self.token_permanent_blacklist)),
+                    "post_tp_lockout": {
+                        tok: {
+                            "lockout_until": float(ts),
+                            "remaining_seconds": max(0, int(ts - self.current_timestamp)),
+                            "remaining_minutes": max(0.0, float((ts - self.current_timestamp) / 60.0)),
+                        } for tok, ts in self.token_post_tp_lockout.items() if ts > self.current_timestamp
                     },
                     "rotation_status": {
                         "auto_rotation_enabled": bool(getattr(self.config, "auto_rotation_enabled", True)),
@@ -1557,6 +1622,14 @@ class FundingRateArbitrage(StrategyV2Base):
         create_actions = []
         for token in self.config.tokens:
             if token not in self.active_funding_arbitrages:
+                # 0. Permanent Blacklist Check (毒币终生累计亏损熔断)
+                if token in self.token_permanent_blacklist:
+                    self.logger().debug(
+                        f"[BLACKLIST-SKIP] Token '{token}' is permanently blacklisted due to severe cumulative historical loss. Skipping entry."
+                    )
+                    self.entry_candidate_ticks[token] = 0
+                    continue
+
                 # 1. Toxic Asset Quarantine Check (拦截有毒重亏损资产)
                 quarantine_info = self.token_quarantine_ledger.get(token)
                 if quarantine_info:
@@ -1572,6 +1645,16 @@ class FundingRateArbitrage(StrategyV2Base):
                     else:
                         self.logger().info(f"[QUARANTINE-RELEASE] Token '{token}' quarantine expired. Returned to active pool.")
                         del self.token_quarantine_ledger[token]
+
+                # 1b. Post-Take-Profit Anti-Churning Lockout (止盈防高位回踩锁定)
+                post_tp_until = self.token_post_tp_lockout.get(token, 0)
+                if self.current_timestamp < post_tp_until:
+                    remaining_tp_m = (post_tp_until - self.current_timestamp) / 60
+                    self.logger().debug(
+                        f"[POST-TP-LOCKOUT] Token '{token}' took profit recently. In post-TP anti-reversion lockout for {remaining_tp_m:.1f}m."
+                    )
+                    self.entry_candidate_ticks[token] = 0
+                    continue
 
                 # 2. Re-entry Cooldown Check (防假止损/频繁开关磨损)
                 last_closed = self.token_last_closed_timestamp.get(token, 0)
@@ -1593,8 +1676,8 @@ class FundingRateArbitrage(StrategyV2Base):
                     seconds_to_settlement = 28800 - seconds_into_cycle
                     if seconds_to_settlement <= blackout_m * 60:
                         tier, _ = self.get_token_tier(token)
-                        tier3_only = getattr(self.config, "settlement_blackout_tier3_only", True)
-                        if (not tier3_only) or (tier == 3):
+                        tier3_only = getattr(self.config, "settlement_blackout_tier3_only", False)
+                        if (not tier3_only and tier > 1) or (tier3_only and tier == 3):
                             self.entry_candidate_ticks[token] = 0
                             self.logger().debug(
                                 f"[SETTLEMENT-BLACKOUT] Token '{token}' (Tier {tier}) is within {seconds_to_settlement/60:.1f}m of 8h settlement. "
@@ -1811,12 +1894,34 @@ class FundingRateArbitrage(StrategyV2Base):
 
     def _evaluate_token_quarantine(self, token: str, net_loss: float):
         """
-        Evaluate if a closed token should be quarantined due to severe loss or consecutive losses.
+        Evaluate if a closed token should be quarantined due to severe loss or consecutive losses,
+        or permanently blacklisted if cumulative historical net loss exceeds threshold.
         """
+        hard_blacklist_usd = float(getattr(self.config, "cumulative_loss_hard_blacklist_usd", 30.0))
         loss_thresh = float(getattr(self.config, "single_loss_quarantine_threshold", Decimal("15.0")))
         quarantine_h = float(getattr(self.config, "token_quarantine_hours", Decimal("24.0")))
 
         past_trades = self.stopped_funding_arbitrages.get(token, [])
+        cum_net_pnl = sum(float(tr.get("total_net_pnl", 0)) for tr in past_trades)
+
+        # 1. Module 3: Permanent Hard Blacklist (毒币终生累计亏损熔断)
+        if cum_net_pnl <= -hard_blacklist_usd:
+            self.token_permanent_blacklist.add(token)
+            self.token_quarantine_ledger[token] = {
+                "quarantine_until": self.current_timestamp + 86400 * 3650,  # 10 years (permanent)
+                "reason": f"Permanent Blacklist: Cumulative Deficit (${cum_net_pnl:.2f} <= -${hard_blacklist_usd:.2f})",
+                "consecutive_losses": len(past_trades),
+                "triggered_at": self.current_timestamp,
+                "loss_amount": cum_net_pnl,
+            }
+            self.logger().error(
+                f"🚫 [HARD-BLACKLIST-TRIGGER] Token '{token}' permanently blacklisted! "
+                f"Cumulative historical net deficit: ${cum_net_pnl:.2f} (Threshold: -${hard_blacklist_usd:.2f}). "
+                f"Strategy will never enter this token again."
+            )
+            return
+
+        # 2. Standard Quarantine for severe or consecutive losses
         consecutive_losses = 0
         for tr in reversed(past_trades):
             if float(tr.get("total_net_pnl", 0)) < 0:
@@ -2010,6 +2115,22 @@ class FundingRateArbitrage(StrategyV2Base):
                     take_profit_target = Decimal(str(self.config.profitability_to_take_profit)) * pos_size
                     take_profit_condition = (not total_net_pnl.is_nan()) and (total_net_pnl > take_profit_target)
 
+                    # Module 2: Dynamic Breakeven Trailing Stop (移动保本止损锁: 达标+0.6%激活, 回撤至+0.05%保本平仓)
+                    be_activation = Decimal(str(getattr(self.config, "breakeven_trailing_activation_pct", Decimal("0.006"))))
+                    be_stop = Decimal(str(getattr(self.config, "breakeven_trailing_stop_pct", Decimal("0.0005"))))
+                    if (not total_pnl_pct.is_nan()) and total_pnl_pct >= be_activation and not funding_arbitrage_info.get("breakeven_active", False):
+                        funding_arbitrage_info["breakeven_active"] = True
+                        self.logger().info(
+                            f"🛡️ [BREAKEVEN-ARMED] Token '{token}' net profit reached {float(total_pnl_pct):+.2%} "
+                            f"(>= {float(be_activation):+.2%}). Breakeven trailing stop armed at +{float(be_stop):.2%}!"
+                        )
+
+                    breakeven_stop_condition = (
+                        funding_arbitrage_info.get("breakeven_active", False)
+                        and (not total_pnl_pct.is_nan())
+                        and (total_pnl_pct <= be_stop)
+                    )
+
                     # Defense 3: Basis Spread Divergence Stop-Loss (基差撕裂快速止损防线)
                     trading_pnl_pct = trading_pnl / pos_size if pos_size > 0 else Decimal("0")
                     max_basis_loss = Decimal(str(getattr(self.config, "max_basis_loss_pct", Decimal("0.005"))))
@@ -2040,13 +2161,15 @@ class FundingRateArbitrage(StrategyV2Base):
                     liq_defense_condition, min_dist_pct, liq_buffer = self.evaluate_liquidation_defense(token, funding_arbitrage_info)
                     token_removed_condition = token not in self.config.tokens
 
-                    if take_profit_condition or basis_divergence_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
+                    if take_profit_condition or breakeven_stop_condition or basis_divergence_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
                         if token_removed_condition:
                             reason = "Manual Rotation: Low Yield Ditch"
                         elif liq_defense_condition:
                             reason = f"Liquidation Defense (Safety Margin {float(min_dist_pct):.1%} <= {float(liq_buffer):.1%})"
                         elif basis_divergence_condition:
                             reason = f"Basis Spread Divergence Stop Loss (Trading PnL {float(trading_pnl_pct):.2%} <= -{float(max_basis_loss):.2%})"
+                        elif breakeven_stop_condition:
+                            reason = f"Breakeven Trailing Stop (Retracement {float(total_pnl_pct):+.2%} <= +{float(be_stop):.2%})"
                         elif take_profit_condition:
                             reason = "Take Profit (Final)" if funding_arbitrage_info.get("partial_tp_executed", False) else "Take Profit"
                         elif current_funding_condition:
@@ -2077,6 +2200,14 @@ class FundingRateArbitrage(StrategyV2Base):
                         self.inversion_tick_counter[token] = 0
                         self._evaluate_token_quarantine(token, float(total_net_pnl))
 
+                        # Module 1: Post-Take-Profit Anti-Churning Lockout (止盈防高位追高锁定)
+                        if "Take Profit" in reason:
+                            cooldown_h = float(getattr(self.config, "post_tp_cooldown_hours", 4.0))
+                            self.token_post_tp_lockout[token] = self.current_timestamp + cooldown_h * 3600.0
+                            self.logger().info(
+                                f"🔒 [POST-TP-LOCKOUT] Token '{token}' took profit! Armed {cooldown_h:.1f}h anti-churning lockout until {datetime.fromtimestamp(self.token_post_tp_lockout[token], timezone.utc).strftime('%H:%M:%S UTC')}."
+                            )
+
                         del self.active_funding_arbitrages[token]
                 except Exception as e:
                     self.logger().warning(f"Error evaluating virtual stop condition for {token}: {e}")
@@ -2094,8 +2225,25 @@ class FundingRateArbitrage(StrategyV2Base):
                     executors_pnl = sum(executor.net_pnl_quote for executor in executors)
                     pos_size = Decimal(str(funding_arbitrage_info.get("position_size_quote", self.config.position_size_quote)))
                     total_net_pnl = Decimal(str(executors_pnl)) + Decimal(str(funding_payments_pnl))
+                    total_pnl_pct = total_net_pnl / pos_size if pos_size > 0 else Decimal("0")
 
                     take_profit_condition = total_net_pnl > Decimal(str(self.config.profitability_to_take_profit)) * pos_size
+
+                    # Module 2: Dynamic Breakeven Trailing Stop (移动保本止损锁: 达标+0.6%激活, 回撤至+0.05%保本平仓)
+                    be_activation = Decimal(str(getattr(self.config, "breakeven_trailing_activation_pct", Decimal("0.006"))))
+                    be_stop = Decimal(str(getattr(self.config, "breakeven_trailing_stop_pct", Decimal("0.0005"))))
+                    if (not total_pnl_pct.is_nan()) and total_pnl_pct >= be_activation and not funding_arbitrage_info.get("breakeven_active", False):
+                        funding_arbitrage_info["breakeven_active"] = True
+                        self.logger().info(
+                            f"🛡️ [BREAKEVEN-ARMED] Token '{token}' net profit reached {float(total_pnl_pct):+.2%} "
+                            f"(>= {float(be_activation):+.2%}). Breakeven trailing stop armed at +{float(be_stop):.2%}!"
+                        )
+
+                    breakeven_stop_condition = (
+                        funding_arbitrage_info.get("breakeven_active", False)
+                        and (not total_pnl_pct.is_nan())
+                        and (total_pnl_pct <= be_stop)
+                    )
 
                     # Defense 3: Basis Spread Divergence Stop-Loss (基差撕裂快速止损防线)
                     trading_pnl_pct = Decimal(str(executors_pnl)) / pos_size if pos_size > 0 else Decimal("0")
@@ -2127,13 +2275,15 @@ class FundingRateArbitrage(StrategyV2Base):
                     liq_defense_condition, min_dist_pct, liq_buffer = self.evaluate_liquidation_defense(token, funding_arbitrage_info)
                     token_removed_condition = token not in self.config.tokens
 
-                    if take_profit_condition or basis_divergence_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
+                    if take_profit_condition or breakeven_stop_condition or basis_divergence_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
                         if token_removed_condition:
                             reason = "Manual Rotation: Low Yield Ditch"
                         elif liq_defense_condition:
                             reason = f"Liquidation Defense (Safety Margin {float(min_dist_pct):.1%} <= {float(liq_buffer):.1%})"
                         elif basis_divergence_condition:
                             reason = f"Basis Spread Divergence Stop Loss (Trading PnL {float(trading_pnl_pct):.2%} <= -{float(max_basis_loss):.2%})"
+                        elif breakeven_stop_condition:
+                            reason = f"Breakeven Trailing Stop (Retracement {float(total_pnl_pct):+.2%} <= +{float(be_stop):.2%})"
                         elif take_profit_condition:
                             reason = "Take Profit (Final)" if funding_arbitrage_info.get("partial_tp_executed", False) else "Take Profit"
                         elif current_funding_condition:
@@ -2157,6 +2307,14 @@ class FundingRateArbitrage(StrategyV2Base):
                         self.token_last_closed_timestamp[token] = self.current_timestamp
                         self.inversion_tick_counter[token] = 0
                         self._evaluate_token_quarantine(token, float(total_net_pnl))
+
+                        # Module 1: Post-Take-Profit Anti-Churning Lockout (止盈防高位追高锁定)
+                        if "Take Profit" in reason:
+                            cooldown_h = float(getattr(self.config, "post_tp_cooldown_hours", 4.0))
+                            self.token_post_tp_lockout[token] = self.current_timestamp + cooldown_h * 3600.0
+                            self.logger().info(
+                                f"🔒 [POST-TP-LOCKOUT] Token '{token}' took profit! Armed {cooldown_h:.1f}h anti-churning lockout until {datetime.fromtimestamp(self.token_post_tp_lockout[token], timezone.utc).strftime('%H:%M:%S UTC')}."
+                            )
 
                         del self.active_funding_arbitrages[token]
                         stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
