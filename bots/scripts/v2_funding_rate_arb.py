@@ -435,10 +435,12 @@ class FundingRateArbitrage(StrategyV2Base):
                         if t not in self.stopped_funding_arbitrages:
                             self.stopped_funding_arbitrages[t] = []
                         self.stopped_funding_arbitrages[t].append(ct)
-                # Gracefully retire and record active positions that are being rotated out
+                # Gracefully retire rotated-out tokens, and rehydrate active tokens
                 for ap in saved_info.get("active_positions", []):
                     t = ap.get("token")
-                    if t and t not in self.config.tokens:
+                    if not t:
+                        continue
+                    if t not in self.config.tokens:
                         if t not in self.stopped_funding_arbitrages:
                             self.stopped_funding_arbitrages[t] = []
                         self.stopped_funding_arbitrages[t].append({
@@ -453,29 +455,72 @@ class FundingRateArbitrage(StrategyV2Base):
                             "total_net_pnl": float(ap.get("net_pnl", 0)),
                             "leverage": int(getattr(self.config, "leverage", 3)),
                         })
-                self.logger().info("[ROTATION] Loaded historical closed trades and retired inactive tokens.")
-                # Auto-initialize quarantine ledger for tokens with heavy or consecutive historical losses
+                    else:
+                        # Re-hydrate active position so it is preserved across restarts
+                        side_val = ap.get("side", "BUY")
+                        side_enum = TradeType.BUY if str(side_val) in ["BUY", "TradeType.BUY"] else TradeType.SELL
+                        p1 = Decimal(str(ap.get("entry_price_1", ap.get("price_1", 1))))
+                        p2 = Decimal(str(ap.get("entry_price_2", ap.get("price_2", 1))))
+                        pos_size = Decimal(str(ap.get("position_size", ap.get("position_size_quote", self.config.position_size_quote))))
+                        open_ts = ap.get("open_timestamp", int(now_ts - ap.get("duration_seconds", 0)))
+                        eff_lev = Decimal(str(ap.get("leverage", self.get_effective_leverage(t, pos_size))))
+
+                        self.active_funding_arbitrages[t] = {
+                            "is_virtual": ap.get("is_virtual", True),
+                            "connector_1": ap.get("connector_1", "hyperliquid_perpetual"),
+                            "connector_2": ap.get("connector_2", "binance_perpetual"),
+                            "side": side_enum,
+                            "open_timestamp": open_ts,
+                            "price_1": p1,
+                            "price_2": p2,
+                            "amount_1": pos_size / p1 if p1 else Decimal("0"),
+                            "amount_2": pos_size / p2 if p2 else Decimal("0"),
+                            "position_size_quote": pos_size,
+                            "leverage": eff_lev,
+                            "entry_fee_quote": Decimal(str(ap.get("entry_fee_quote", 0))),
+                            "expected_profitability": Decimal(str(ap.get("expected_profitability", 0))),
+                            "entry_profitability_after_fees": Decimal(str(ap.get("entry_spread_pct", 0))),
+                            "payback_hours": float(ap.get("payback_hours", 0)),
+                            "entry_friction_pct": float(ap.get("entry_friction_pct", 0)),
+                            "funding_payments": ap.get("funding_payments", []),
+                            "next_funding_time_1": int(ap.get("next_funding_1", 0)),
+                            "next_funding_time_2": int(ap.get("next_funding_2", 0)),
+                            "executors_ids": ap.get("executors_ids", ["DRY_RUN_SANDBOX"]),
+                        }
+                        self.logger().info(
+                            f"[REHYDRATE] Restored active position for {t}: "
+                            f"{side_val} | Size: ${float(pos_size):,.2f} | Leverage: {eff_lev}x | Open: {open_ts}"
+                        )
+                self.logger().info("[ROTATION] Loaded historical closed trades and rehydrated active positions.")
+                # Auto-initialize quarantine ledger for tokens with heavy historical net deficit
                 for t_name, t_trades in self.stopped_funding_arbitrages.items():
                     if t_trades:
-                        recent_losses = [p for p in t_trades if float(p.get("total_net_pnl", 0)) < 0]
+                        cum_net_pnl = sum(float(p.get("total_net_pnl", 0)) for p in t_trades)
+                        consec_losses = 0
+                        for p in reversed(t_trades):
+                            if float(p.get("total_net_pnl", 0)) < 0:
+                                consec_losses += 1
+                            else:
+                                break
                         last_pnl = float(t_trades[-1].get("total_net_pnl", 0))
                         loss_thresh = float(getattr(self.config, "single_loss_quarantine_threshold", Decimal("15.0")))
                         quarantine_h = float(getattr(self.config, "token_quarantine_hours", Decimal("24.0")))
-                        if last_pnl < -loss_thresh or len(recent_losses) >= 2:
-                            loss_sum = float(sum(float(p.get('total_net_pnl', 0)) for p in recent_losses))
+
+                        # Only quarantine if token has true net loss deficit AND (last heavy loss or consecutive recent losses)
+                        if (last_pnl < -loss_thresh or (consec_losses >= 2 and cum_net_pnl < 0)) and cum_net_pnl < -loss_thresh:
                             self.token_quarantine_ledger[t_name] = {
                                 "quarantine_until": now_ts + quarantine_h * 3600,
-                                "reason": f"Historical Loss Deficit (${loss_sum:.2f})",
-                                "consecutive_losses": len(recent_losses),
-                                "loss_amount": loss_sum,
+                                "reason": f"Historical Loss Deficit (${cum_net_pnl:.2f})",
+                                "consecutive_losses": consec_losses,
+                                "loss_amount": cum_net_pnl,
                                 "triggered_at": now_ts,
                             }
                             self.logger().warning(
-                                f"[QUARANTINE-INIT] Auto-quarantined token '{t_name}' due to heavy historical losses "
-                                f"(${loss_sum:.2f}) for {quarantine_h:.0f}h."
+                                f"[QUARANTINE-INIT] Auto-quarantined token '{t_name}' due to heavy historical deficit "
+                                f"(${cum_net_pnl:.2f}) for {quarantine_h:.0f}h."
                             )
         except Exception as e:
-            self.logger().debug(f"Failed to load historical closed trades: {e}")
+            self.logger().error(f"[START-ERROR] Failed to load historical closed trades and active positions: {e}", exc_info=True)
 
         # Patch Hyperliquid WebSocket funding rate bug if needed
         try:
