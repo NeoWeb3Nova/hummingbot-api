@@ -144,6 +144,32 @@ flowchart LR
   - 采用 Streamlit `st.fragment` 局部刷新机制；
   - 对只读静态资源缓存；保持数据拉取与 DOM 渲染解耦。
 
+### 11. Instances 页面顶栏核心 KPI（NET PNL / Unrealized PNL / Volume Traded）全零陷阱
+- **现象**：在 Dashboard Instances 页面中，顶栏最显眼的 4 个总览卡片始终显示：
+  `NET PNL: $0.00`、`💹 Unrealized PNL: $0.00`、`📊 NET PNL (%): 0.00%`、`💸 Volume Traded: $0.00`，即使用户已持有多个高额对冲仓位且发生了历史平仓。
+- **根因**：
+  - Hummingbot 原生 Dashboard 为标准方向型子控制器架构（如 `directional_trading_1`、`dmm_1`）设计；
+  - 统计循环在遍历 `performance.items()` 时，代码中显式加入了 `if controller == "funding_rate_arb": continue` 跳过；
+  - 资金费率套利策略为独立单例策略脚本，无挂载常规子控制器，导致总览累加器从未被赋值，始终保持默认的 0.0。
+- **避坑准则与修复对策**：
+  - 在计算 KPI 前，前置识别资金费套利机器人状态；
+  - 提取 `funding_rate_arb` 的 `performance` 字段，将其直接汇入顶栏 totals；
+  - 设立兜底与双边货值换算逻辑（若数据源延迟，从 `arbitrage_trades.json` 重建）：
+    - `Unrealized PNL` = 所有活跃头寸浮动损益 + 累计资金费；
+    - `NET PNL` = 历史所有已实现平仓盈亏 + 当前未实现盈亏；
+    - `Volume Traded` = 活跃头寸双边开仓货值（$2 \times Size$）+ 历史平仓头寸双边开平总货值（$4 \times Size$）；
+    - `NET PNL (%)` = `NET PNL / Volume Traded`。
+
+
+### 12. 官方主版本升级冲突与代码解耦防范体系 (Upstream Upgrade Conflict Prevention)
+- **现象**：当 Hummingbot 官方发布新版本或重构 UI 路由时，若开发者直接在官方主文件（如 `app.py`）中硬编码数百行私有业务逻辑，执行 `git merge / rebase` 会遭遇严重冲突，导致定制功能损毁或无法享受官方最新功能。
+- **根因**：高度耦合的单体文件侵入性修改违背了开闭原则（Open-Closed Principle）。
+- **避坑准则与工程对策**：
+  - **核心逻辑物理隔离**：将 700+ 行定制代码剥离为独立自包含组件（如 `frontend/components/funding_arbitrage_view.py`），使官方代码树对该文件无感知，实现冲突率 0%；
+  - **极简插槽挂载**：官方原生文件（`app.py`）仅保留条件防护盾（`if is_funding_arb_bot`）与组件函数调用（Hook），压缩合并面；
+  - **双源拓扑与自动化同步**：配置官方 `upstream` 远端仓库，并配合根目录运维工具 [`sync-upstream.sh`](file:///home/neo/projects/hummingbot/sync-upstream.sh) 实现一键自检与变基；
+  - **标准升级作业流程**：详见专题 SOP 文档 [`docs/UPSTREAM_UPGRADE_SOP.md`](file:///home/neo/projects/hummingbot/docs/UPSTREAM_UPGRADE_SOP.md)。
+
 ---
 
 ## 四、核心财务与风控数学指标手册
@@ -169,6 +195,31 @@ flowchart LR
 
 ### 3. 动态容量算法
 $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} \times 0.3, \sum_{k=1}^{25} (P_k \times Q_k)_{c2} \times 0.3\right)$$
+
+### 4. 真实本金收益率 (ROE) vs 高频成交量利润率 (Volume Turnover PnL)
+- **高频量化做市口径（原生 Dashboard 默认）**：
+  $$PnL_{volume} = \frac{\text{NET PNL}}{\text{Total Volume Traded}}$$
+  - 弊端：因为对冲套利频繁换手开平，双边开平总撮合量迅速累积至数十万美元（如 $363,400）。若以此为分母，$-272 / 363,400 = -0.07\%$，极度稀释了真实盈亏感知，造成“亏损只有万分之几”的错觉。
+- **真实投资收益率口径（套利量化标准 ROE）**：
+  $$ROE = \frac{\text{NET PNL}}{\text{双边真实实缴总保证金 (Total Margin)}}$$
+  - 以当前 3 笔活跃持仓（单边货值 $21,700，3x 杠杆）为例，双边实缴保证金为 $\$14,466.67$：
+    $$ROE = \frac{-\$272.81}{\$14,466.67} = \mathbf{-1.89\%}$$
+  - 前端已全面升级，主指标直接对标真实实缴本金显示 **`-1.89%`**，并在副标题中备注成交量换算比，杜绝口径混淆。
+
+### 5. 跨所微观基差偏离（Basis Divergence）与三维账本拆解体系
+- **浮动盈亏（Unrealized PnL）剧烈跳动的核心因子归因追踪**：
+  1. **手续费（Trading Fees，占比 ~5%）**：Taker 双边固定为 0.08%~0.10%，只在开仓/平仓瞬间扣减一次，额度固定且微小；
+  2. **吃单滑点（Slippage，占比 ~10%）**：由于策略已内置 Top 25 档动态定额（Dynamic Sizing），开仓额限制在流动性安全线内，滑点损耗平稳；
+  3. **两所微观盘口基差偏离（Basis Divergence，占比 >85%！）**：
+     - **这是导致浮动盈亏与瞬时 ROE 每秒剧烈跳动的核心根源！**  
+     - *现场真实案例*：以币种 **2Z** 为例，开仓时两所基差为 `-0.03%`（价差几乎为 0）。但在持仓过程中，币安端因大买单单边冲高涨了 **+3.7%**，而 Hyperliquid 盘口由于做市商补单滞后价格未跟涨，导致做空腿瞬时产生 `-$202` 的基差浮亏！  
+     - *后续演进*：一旦两所套利搬砖资金拉平基差，或者价格回归均值，这 `-$202` 的浮亏就会迅速回弹抹平。**只要不触发止损、不主动平仓，这种浮亏就只是未实现的“纸面账目”，而不是真实亏损！**
+- **为什么拿“当前瞬时持仓保证金”算总收益率有严重缺陷？**  
+  - 机器人在持续开仓和平仓：持仓 5 个币时保证金为 $14,466，若 4 个币止盈平仓后只剩 1 个币（保证金 $1,133），**分母急剧缩水 10 倍**，收益率百分比就会被动暴涨或暴跌；若全部空仓，分母甚至变成 0！
+- **量化界公认的「三大真实对账真理指标」**：
+  1. **已平仓结清利润（Realized Net PnL）**：实盘战绩真金白银（当前已平仓 21 笔，累计完全锁定纯利润 **`+$181.47`**！）；
+  2. **纯资金费利息现金流（Funding Harvested）**：只看收到多少利息（当前累计收息 **`+$10.23`**），只增不减、永不回退；
+  3. **规划总本金池净值收益率（Portfolio Committed NAV ROI）**：以固定总充值池（如 $30,000）为恒定分母，提供稳定连续的净值曲线。
 
 ---
 
