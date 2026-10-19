@@ -86,9 +86,9 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
         }
     )
     max_orderbook_depth_ratio: Decimal = Field(
-        default=Decimal("0.3"),
+        default=Decimal("0.15"),
         json_schema_extra={
-            "prompt": lambda mi: "Max ratio of top-10 order book depth to consume (e.g. 0.3 for 30%): ",
+            "prompt": lambda mi: "Max ratio of top order book depth to consume (e.g. 0.15 for 15%): ",
             "prompt_on_new": True,
         }
     )
@@ -155,14 +155,62 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": False,
         }
     )
+    entry_persistence_ticks: int = Field(
+        default=3,
+        json_schema_extra={
+            "prompt": lambda mi: "Consecutive ticks of positive spread/payback required to confirm entry (e.g. 3): ",
+            "prompt_on_new": False,
+        }
+    )
+    max_basis_loss_pct: Decimal = Field(
+        default=Decimal("0.005"),
+        json_schema_extra={
+            "prompt": lambda mi: "Max allowed trading PnL basis loss ratio before emergency cut (e.g. 0.005 for 0.5%): ",
+            "prompt_on_new": False,
+        }
+    )
+    settlement_blackout_minutes: int = Field(
+        default=30,
+        json_schema_extra={
+            "prompt": lambda mi: "Minutes before 8h funding settlement to freeze new entries on volatile tokens (e.g. 30): ",
+            "prompt_on_new": False,
+        }
+    )
+    settlement_blackout_tier3_only: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": lambda mi: "Only apply settlement blackout to Tier 3 tokens? (True/False): ",
+            "prompt_on_new": False,
+        }
+    )
+    tier_1_tokens: Set[str] = Field(
+        default="BTC,ETH,SOL",
+        json_schema_extra={"prompt": lambda mi: "Tier 1 mega-cap tokens (e.g. BTC,ETH,SOL): ", "prompt_on_new": False}
+    )
+    tier_1_max_quote: Decimal = Field(
+        default=Decimal("10000.0"),
+        json_schema_extra={"prompt": lambda mi: "Tier 1 maximum position size quote (e.g. 10000.0): ", "prompt_on_new": False}
+    )
+    tier_2_tokens: Set[str] = Field(
+        default="AVAX,SUI,APT,NEAR,LINK,ARB,OP,INJ,DOGE,XRP,ADA,MATIC,DOT,UNI,LTC,BCH,BNB,SAND",
+        json_schema_extra={"prompt": lambda mi: "Tier 2 large/mid-cap tokens: ", "prompt_on_new": False}
+    )
+    tier_2_max_quote: Decimal = Field(
+        default=Decimal("2000.0"),
+        json_schema_extra={"prompt": lambda mi: "Tier 2 maximum position size quote (e.g. 2000.0): ", "prompt_on_new": False}
+    )
+    tier_3_max_quote: Decimal = Field(
+        default=Decimal("500.0"),
+        json_schema_extra={"prompt": lambda mi: "Tier 3 micro-cap / meme tokens maximum position size quote (e.g. 500.0): ", "prompt_on_new": False}
+    )
 
-
-
-    @field_validator("connectors", "tokens", mode="before")
+    @field_validator("connectors", "tokens", "tier_1_tokens", "tier_2_tokens", mode="before")
     @classmethod
     def validate_sets(cls, v):
         if isinstance(v, str):
             return set(v.split(","))
+        if isinstance(v, (list, tuple)):
+            return set(v)
         return v
 
     def update_markets(self, markets: MarketDict) -> MarketDict:
@@ -394,6 +442,32 @@ class FundingRateArbitrage(StrategyV2Base):
         self.token_quarantine_ledger: Dict[str, Dict] = {}  # token -> {"quarantine_until": float, "reason": str, "consecutive_losses": int}
         self.inversion_tick_counter: Dict[str, int] = {}    # token -> int (ticks of sustained rate inversion)
         self.token_last_closed_timestamp: Dict[str, float] = {} # token -> float (timestamp of last closure)
+        # Defense 1: Entry Hysteresis persistence counters
+        self.entry_candidate_ticks: Dict[str, int] = {}     # token -> int (consecutive ticks meeting entry criteria)
+
+    def get_token_tier(self, token: str) -> Tuple[int, Decimal]:
+        """
+        Determine token risk tier and maximum position size quote.
+        Tier 1: Mega-cap (BTC, ETH, SOL)
+        Tier 2: Major alts (AVAX, SUI, APT, NEAR, LINK, ARB, OP, INJ, SAND, etc.)
+        Tier 3: Micro-cap / meme / high-volatility tokens (BLUR, 2Z, BERA, RSR, etc.)
+        """
+        canon = self.get_canonical_token(token).upper()
+        t1_tokens = getattr(self.config, "tier_1_tokens", {"BTC", "ETH", "SOL"})
+        t1_set = {self.get_canonical_token(x).upper() for x in (t1_tokens if isinstance(t1_tokens, (set, list, tuple)) else str(t1_tokens).split(","))}
+
+        t2_tokens = getattr(self.config, "tier_2_tokens", {
+            "AVAX", "SUI", "APT", "NEAR", "LINK", "ARB", "OP", "INJ",
+            "DOGE", "XRP", "ADA", "MATIC", "DOT", "UNI", "LTC", "BCH", "BNB", "SAND"
+        })
+        t2_set = {self.get_canonical_token(x).upper() for x in (t2_tokens if isinstance(t2_tokens, (set, list, tuple)) else str(t2_tokens).split(","))}
+
+        if canon in t1_set:
+            return 1, Decimal(str(getattr(self.config, "tier_1_max_quote", Decimal("10000.0"))))
+        elif canon in t2_set:
+            return 2, Decimal(str(getattr(self.config, "tier_2_max_quote", Decimal("2000.0"))))
+        else:
+            return 3, Decimal(str(getattr(self.config, "tier_3_max_quote", Decimal("500.0"))))
 
     def get_effective_leverage(self, token: str, position_size_quote: Decimal) -> int:
         """
@@ -519,6 +593,10 @@ class FundingRateArbitrage(StrategyV2Base):
                                 f"[QUARANTINE-INIT] Auto-quarantined token '{t_name}' due to heavy historical deficit "
                                 f"(${cum_net_pnl:.2f}) for {quarantine_h:.0f}h."
                             )
+                # Also restore any directly quarantined tokens from json if saved
+                for q_tok, q_data in saved_info.get("quarantined_tokens", {}).items():
+                    if q_data.get("quarantine_until", 0) > now_ts:
+                        self.token_quarantine_ledger[q_tok] = q_data
         except Exception as e:
             self.logger().error(f"[START-ERROR] Failed to load historical closed trades and active positions: {e}", exc_info=True)
 
@@ -664,6 +742,7 @@ class FundingRateArbitrage(StrategyV2Base):
 
             active_list.append({
                 "token": token,
+                "tier": int(self.get_token_tier(token)[0]),
                 "connector_1": arb["connector_1"],
                 "connector_2": arb["connector_2"],
                 "side": arb["side"].name if hasattr(arb["side"], "name") else str(arb["side"]),
@@ -1002,13 +1081,17 @@ class FundingRateArbitrage(StrategyV2Base):
         max_target_size: Decimal
     ) -> Decimal:
         """
-        Dynamically calculate safe position size based on order book depth of both exchanges.
+        Dynamically calculate safe position size based on token risk tier and order book depth of both exchanges.
         Takes the minimum safe capacity between connector 1 and connector 2 to guarantee
         neither leg exceeds the order book depth limit or suffers excessive slippage.
         """
         try:
-            depth_ratio = Decimal(str(getattr(self.config, "max_orderbook_depth_ratio", 0.3)))
-            min_size = Decimal(str(getattr(self.config, "min_position_size_quote", 100)))
+            tier, tier_cap = self.get_token_tier(token)
+            effective_target = min(max_target_size, tier_cap)
+
+            base_depth_ratio = Decimal(str(getattr(self.config, "max_orderbook_depth_ratio", Decimal("0.15"))))
+            depth_ratio = min(base_depth_ratio, Decimal("0.10")) if tier == 3 else base_depth_ratio
+            min_size = Decimal(str(getattr(self.config, "min_position_size_quote", Decimal("100.0"))))
 
             safe_capacities = []
             legs = [
@@ -1032,26 +1115,28 @@ class FundingRateArbitrage(StrategyV2Base):
 
             if safe_capacities:
                 bottleneck_capacity = min(safe_capacities)
-                calculated_size = min(max_target_size, bottleneck_capacity)
+                calculated_size = min(effective_target, bottleneck_capacity)
                 if calculated_size >= min_size:
                     step = Decimal("50")
                     rounded_size = (calculated_size // step) * step
                     final_size = max(min_size, rounded_size)
                     self.logger().info(
-                        f"[DYNAMIC-SIZING] Token {token}: Target=${float(max_target_size):,.0f}, "
-                        f"OrderBook Safe Capacity=${float(bottleneck_capacity):,.0f} -> Dynamic Size: ${float(final_size):,.0f}"
+                        f"[DYNAMIC-SIZING] Token {token} (Tier {tier}, Tier Cap: ${float(tier_cap):,.0f}): "
+                        f"OrderBook Safe Capacity=${float(bottleneck_capacity):,.0f} (Ratio: {float(depth_ratio):.0%}) "
+                        f"-> Dynamic Size: ${float(final_size):,.0f}"
                     )
                     return final_size
                 else:
                     self.logger().warning(
-                        f"[DYNAMIC-SIZING] Token {token}: OrderBook safe capacity (${float(bottleneck_capacity):,.1f}) "
+                        f"[DYNAMIC-SIZING] Token {token} (Tier {tier}): OrderBook safe capacity (${float(bottleneck_capacity):,.1f}) "
                         f"is below min allowed (${float(min_size):,.1f}). Using min size."
                     )
                     return min_size
         except Exception as e:
             self.logger().debug(f"Dynamic sizing calculation error for {token}: {e}")
 
-        return max_target_size
+        tier, tier_cap = self.get_token_tier(token)
+        return min(max_target_size, tier_cap)
 
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
         """
@@ -1071,6 +1156,7 @@ class FundingRateArbitrage(StrategyV2Base):
                             f"[QUARANTINE-SKIP] Token '{token}' is quarantined for next {remaining_m:.1f}m. "
                             f"Reason: {quarantine_info.get('reason')}."
                         )
+                        self.entry_candidate_ticks[token] = 0
                         continue
                     else:
                         self.logger().info(f"[QUARANTINE-RELEASE] Token '{token}' quarantine expired. Returned to active pool.")
@@ -1084,188 +1170,232 @@ class FundingRateArbitrage(StrategyV2Base):
                     self.logger().debug(
                         f"[COOLDOWN-SKIP] Token '{token}' closed recently. In re-entry cooldown for {remaining_s:.0f}s."
                     )
+                    self.entry_candidate_ticks[token] = 0
                     continue
+
+                # 3. Pre-Settlement Blackout Window (费率结算前黑障区保护)
+                blackout_m = int(getattr(self.config, "settlement_blackout_minutes", 30))
+                if blackout_m > 0:
+                    now_utc = int(self.current_timestamp)
+                    # 8-hour funding intervals: 00:00, 08:00, 16:00 UTC (every 28800s)
+                    seconds_into_cycle = now_utc % 28800
+                    seconds_to_settlement = 28800 - seconds_into_cycle
+                    if seconds_to_settlement <= blackout_m * 60:
+                        tier, _ = self.get_token_tier(token)
+                        tier3_only = getattr(self.config, "settlement_blackout_tier3_only", True)
+                        if (not tier3_only) or (tier == 3):
+                            self.entry_candidate_ticks[token] = 0
+                            self.logger().debug(
+                                f"[SETTLEMENT-BLACKOUT] Token '{token}' (Tier {tier}) is within {seconds_to_settlement/60:.1f}m of 8h settlement. "
+                                f"Entry frozen to protect against rate manipulation and sudden flips."
+                            )
+                            continue
 
                 funding_info_report = self.get_funding_info_by_token(token)
                 best_combination = self.get_most_profitable_combination(funding_info_report)
                 if not best_combination:
+                    self.entry_candidate_ticks[token] = 0
                     continue
 
                 connector_1, connector_2, trade_side, expected_profitability = best_combination
-                if expected_profitability >= self.config.min_funding_rate_profitability:
-                    # Dynamically size position first to reflect real orderbook capacity
-                    pos_size = self.config.position_size_quote
-                    if getattr(self.config, "dynamic_position_sizing", True):
-                        pos_size = self.calculate_dynamic_position_size(
-                            token=token,
-                            connector_1=connector_1,
-                            connector_2=connector_2,
-                            trade_side=trade_side,
-                            max_target_size=self.config.position_size_quote,
-                        )
+                if expected_profitability < self.config.min_funding_rate_profitability:
+                    self.entry_candidate_ticks[token] = 0
+                    continue
 
-                    current_profitability = self.get_current_profitability_after_fees(
-                        token, connector_1, connector_2, trade_side, quote_volume=pos_size
+                # Dynamically size position first to reflect real orderbook capacity
+                pos_size = self.config.position_size_quote
+                if getattr(self.config, "dynamic_position_sizing", True):
+                    pos_size = self.calculate_dynamic_position_size(
+                        token=token,
+                        connector_1=connector_1,
+                        connector_2=connector_2,
+                        trade_side=trade_side,
+                        max_target_size=self.config.position_size_quote,
                     )
 
-                    # Mode 1: Payback Period Barrier (回本周期硬性拦截)
-                    hourly_yield = expected_profitability / Decimal("24")
-                    if current_profitability < 0:
-                        friction_pct = -current_profitability
-                        payback_hours = (friction_pct / hourly_yield) if hourly_yield > 0 else Decimal("999999")
-                    else:
-                        friction_pct = Decimal("0")
-                        payback_hours = Decimal("0")
+                current_profitability = self.get_current_profitability_after_fees(
+                    token, connector_1, connector_2, trade_side, quote_volume=pos_size
+                )
 
-                    max_allowed_payback = Decimal(str(getattr(self.config, "max_payback_hours", Decimal("12.0"))))
-                    if payback_hours > max_allowed_payback:
-                        self.logger().info(
-                            f"[PAYBACK-BARRIER] Token {token} entry friction {float(friction_pct):.3%} requires "
-                            f"{float(payback_hours):.1f}h of funding to breakeven (limit: {float(max_allowed_payback):.1f}h). "
-                            f"Skipping entry to protect capital from excessive spread."
-                        )
-                        continue
+                # Mode 1: Payback Period Barrier (回本周期硬性拦截)
+                hourly_yield = expected_profitability / Decimal("24")
+                if current_profitability < 0:
+                    friction_pct = -current_profitability
+                    payback_hours = (friction_pct / hourly_yield) if hourly_yield > 0 else Decimal("999999")
+                else:
+                    friction_pct = Decimal("0")
+                    payback_hours = Decimal("0")
 
-                    # Mode 2: Hard Spread Friction Ceiling (流动性滑点与负基差硬天花板)
-                    max_entry_friction = Decimal(str(getattr(self.config, "max_entry_spread_friction_pct", Decimal("0.005"))))
-                    if friction_pct > max_entry_friction:
-                        self.logger().info(
-                            f"[SPREAD-FRICTION-BARRIER] Token {token} entry friction {float(friction_pct):.3%} exceeds "
-                            f"hard limit of {float(max_entry_friction):.2%}. Skipping entry to avoid illiquid slippage trap."
-                        )
-                        continue
-
-                    if self.config.trade_profitability_condition_to_enter:
-                        if current_profitability < 0:
-                            self.logger().info(
-                                f"Best Combination: {connector_1} | {connector_2} | {trade_side} "
-                                f"Funding rate profitability: {expected_profitability} "
-                                f"Trading profitability after fees: {current_profitability} "
-                                f"Trade profitability is negative, skipping..."
-                            )
-                            continue
-
+                max_allowed_payback = Decimal(str(getattr(self.config, "max_payback_hours", Decimal("12.0"))))
+                if payback_hours > max_allowed_payback:
                     self.logger().info(
-                        f"Best Combination: {connector_1} | {connector_2} | {trade_side} "
-                        f"Funding rate profitability: {expected_profitability:.4%} "
-                        f"Trading profitability after fees: {current_profitability:.4%} "
-                        f"Payback: {float(payback_hours):.1f}h (Limit: {float(max_allowed_payback):.1f}h)"
+                        f"[PAYBACK-BARRIER] Token {token} entry friction {float(friction_pct):.3%} requires "
+                        f"{float(payback_hours):.1f}h of funding to breakeven (limit: {float(max_allowed_payback):.1f}h). "
+                        f"Skipping entry to protect capital from excessive spread."
                     )
+                    self.entry_candidate_ticks[token] = 0
+                    continue
 
-                    trading_pair_1 = self.get_trading_pair_for_connector(token, connector_1)
-                    trading_pair_2 = self.get_trading_pair_for_connector(token, connector_2)
-                    p1 = self.get_safe_quote_price(
-                        connector_name=connector_1,
-                        trading_pair=trading_pair_1,
-                        quote_volume=pos_size,
-                        is_buy=trade_side == TradeType.BUY,
+                # Mode 2: Hard Spread Friction Ceiling (流动性滑点与负基差硬天花板)
+                max_entry_friction = Decimal(str(getattr(self.config, "max_entry_spread_friction_pct", Decimal("0.005"))))
+                if friction_pct > max_entry_friction:
+                    self.logger().info(
+                        f"[SPREAD-FRICTION-BARRIER] Token {token} entry friction {float(friction_pct):.3%} exceeds "
+                        f"hard limit of {float(max_entry_friction):.2%}. Skipping entry to avoid illiquid slippage trap."
                     )
-                    p2 = self.get_safe_quote_price(
-                        connector_name=connector_2,
-                        trading_pair=trading_pair_2,
-                        quote_volume=pos_size,
-                        is_buy=trade_side != TradeType.BUY,
-                    )
+                    self.entry_candidate_ticks[token] = 0
+                    continue
 
-                    # Asset Consistency & Price Divergence Circuit Breaker (同名不同币与假币强熔断防御)
-                    m1 = Decimal(str(self.get_token_multiplier(token, connector_1)))
-                    m2 = Decimal(str(self.get_token_multiplier(token, connector_2)))
-                    p1_norm = p1 / m1
-                    p2_norm = p2 / m2
-                    avg_p = (p1_norm + p2_norm) / Decimal("2")
-                    if avg_p > Decimal("0"):
-                        price_divergence = abs(p1_norm - p2_norm) / avg_p
-                        max_div = Decimal(str(getattr(self.config, "max_allowed_price_divergence", Decimal("0.03"))))
-                        if price_divergence > max_div:
-                            self.logger().warning(
-                                f"[ASSET-INTEGRITY-REJECT] Token '{token}' cross-exchange normalized price divergence is {float(price_divergence):.2%} "
-                                f"({connector_1} raw:${float(p1):.4f}/norm:${float(p1_norm):.6f} vs {connector_2} raw:${float(p2):.4f}/norm:${float(p2_norm):.6f}), "
-                                f"exceeding safe limit of {float(max_div):.1%}!\n"
-                                f"  Suspected homonym ticker collision (同名不同币), unannounced token split/rebrand, or fake impostor asset. "
-                                f"Entry rejected immediately to protect capital!"
-                            )
-                            continue
-
-                    if self.config.dry_run:
-                        # Open Virtual Position in Sandbox
-                        fee_pct_1 = self.connectors[connector_1].get_fee(
-                            base_currency=trading_pair_1.split("-")[0],
-                            quote_currency=trading_pair_1.split("-")[1],
-                            order_type=OrderType.MARKET,
-                            order_side=TradeType.BUY,
-                            amount=pos_size / p1,
-                            price=p1,
-                            is_maker=False,
-                            position_action=PositionAction.OPEN
-                        ).percent
-                        fee_pct_2 = self.connectors[connector_2].get_fee(
-                            base_currency=trading_pair_2.split("-")[0],
-                            quote_currency=trading_pair_2.split("-")[1],
-                            order_type=OrderType.MARKET,
-                            order_side=TradeType.BUY,
-                            amount=pos_size / p2,
-                            price=p2,
-                            is_maker=False,
-                            position_action=PositionAction.OPEN
-                        ).percent
-
-                        eff_lev = self.get_effective_leverage(token, pos_size)
-                        self.active_funding_arbitrages[token] = {
-                            "is_virtual": True,
-                            "connector_1": connector_1,
-                            "connector_2": connector_2,
-                            "side": trade_side,
-                            "open_timestamp": self.current_timestamp,
-                            "price_1": p1,
-                            "price_2": p2,
-                            "amount_1": pos_size / p1,
-                            "amount_2": pos_size / p2,
-                            "position_size_quote": pos_size,
-                            "leverage": eff_lev,
-                            "entry_fee_quote": (fee_pct_1 + fee_pct_2) * pos_size,
-                            "expected_profitability": expected_profitability,
-                            "entry_profitability_after_fees": current_profitability,
-                            "payback_hours": float(payback_hours),
-                            "entry_friction_pct": float(friction_pct),
-                            "funding_payments": [],
-                            "next_funding_time_1": funding_info_report[connector_1].next_funding_utc_timestamp,
-                            "next_funding_time_2": funding_info_report[connector_2].next_funding_utc_timestamp,
-                            "executors_ids": ["DRY_RUN_SANDBOX"],
-                        }
+                if self.config.trade_profitability_condition_to_enter:
+                    if current_profitability < 0:
                         self.logger().info(
-                            f"[DRY-RUN] Virtual Arbitrage Position Established for {token}!\n"
-                            f"  Leg 1 ({connector_1}): {'BUY' if trade_side == TradeType.BUY else 'SELL'} @ {p1:.4f}\n"
-                            f"  Leg 2 ({connector_2}): {'SELL' if trade_side == TradeType.BUY else 'BUY'} @ {p2:.4f}\n"
-                            f"  Notional Size: ${float(pos_size):,.2f} | Leverage: {eff_lev}x ({'Zero-Leverage Safe' if eff_lev == 1 else 'Capital Boost'})\n"
-                            f"  Daily Rate Diff: {expected_profitability:.4%}, Net Entry Spread: {current_profitability:.4%}"
+                            f"Best Combination: {connector_1} | {connector_2} | {trade_side} "
+                            f"Funding rate profitability: {expected_profitability} "
+                            f"Trading profitability after fees: {current_profitability} "
+                            f"Trade profitability is negative, skipping..."
                         )
-                    else:
-                        # Real Live Trading Executors
-                        eff_lev = self.get_effective_leverage(token, pos_size)
-                        self.logger().info(f"Starting live executors for {token} with dynamic size ${float(pos_size):,.2f} (Leverage: {eff_lev}x)...")
-                        position_executor_config_1, position_executor_config_2 = self.get_position_executors_config(
-                            token, connector_1, connector_2, trade_side, position_size_quote=pos_size
-                        )
-                        self.active_funding_arbitrages[token] = {
-                            "is_virtual": False,
-                            "connector_1": connector_1,
-                            "connector_2": connector_2,
-                            "executors_ids": [position_executor_config_1.id, position_executor_config_2.id],
-                            "side": trade_side,
-                            "open_timestamp": self.current_timestamp,
-                            "price_1": p1,
-                            "price_2": p2,
-                            "amount_1": pos_size / p1,
-                            "amount_2": pos_size / p2,
-                            "position_size_quote": pos_size,
-                            "leverage": eff_lev,
-                            "expected_profitability": expected_profitability,
-                            "entry_profitability_after_fees": current_profitability,
-                            "funding_payments": [],
-                        }
+                        self.entry_candidate_ticks[token] = 0
+                        continue
 
-                        return [CreateExecutorAction(executor_config=position_executor_config_1),
-                                CreateExecutorAction(executor_config=position_executor_config_2)]
+                trading_pair_1 = self.get_trading_pair_for_connector(token, connector_1)
+                trading_pair_2 = self.get_trading_pair_for_connector(token, connector_2)
+                p1 = self.get_safe_quote_price(
+                    connector_name=connector_1,
+                    trading_pair=trading_pair_1,
+                    quote_volume=pos_size,
+                    is_buy=trade_side == TradeType.BUY,
+                )
+                p2 = self.get_safe_quote_price(
+                    connector_name=connector_2,
+                    trading_pair=trading_pair_2,
+                    quote_volume=pos_size,
+                    is_buy=trade_side != TradeType.BUY,
+                )
+
+                # Asset Consistency & Price Divergence Circuit Breaker (同名不同币与假币强熔断防御)
+                m1 = Decimal(str(self.get_token_multiplier(token, connector_1)))
+                m2 = Decimal(str(self.get_token_multiplier(token, connector_2)))
+                p1_norm = p1 / m1
+                p2_norm = p2 / m2
+                avg_p = (p1_norm + p2_norm) / Decimal("2")
+                if avg_p > Decimal("0"):
+                    price_divergence = abs(p1_norm - p2_norm) / avg_p
+                    max_div = Decimal(str(getattr(self.config, "max_allowed_price_divergence", Decimal("0.03"))))
+                    if price_divergence > max_div:
+                        self.logger().warning(
+                            f"[ASSET-INTEGRITY-REJECT] Token '{token}' cross-exchange normalized price divergence is {float(price_divergence):.2%} "
+                            f"({connector_1} raw:${float(p1):.4f}/norm:${float(p1_norm):.6f} vs {connector_2} raw:${float(p2):.4f}/norm:${float(p2_norm):.6f}), "
+                            f"exceeding safe limit of {float(max_div):.1%}!\n"
+                            f"  Suspected homonym ticker collision (同名不同币), unannounced token split/rebrand, or fake impostor asset. "
+                            f"Entry rejected immediately to protect capital!"
+                        )
+                        self.entry_candidate_ticks[token] = 0
+                        continue
+
+                # Defense 1: Entry Hysteresis & Persistence Filter (开仓迟滞滤波 / 连续 N 次 Tick 确认)
+                req_ticks = int(getattr(self.config, "entry_persistence_ticks", 3))
+                self.entry_candidate_ticks[token] = self.entry_candidate_ticks.get(token, 0) + 1
+                if self.entry_candidate_ticks[token] < req_ticks:
+                    self.logger().info(
+                        f"[ENTRY-HYSTERESIS] Token '{token}' passed criteria ({self.entry_candidate_ticks[token]}/{req_ticks} ticks). "
+                        f"Spread={float(current_profitability):+.3%}, Payback={float(payback_hours):.1f}h. Waiting for sustained signal..."
+                    )
+                    continue
+
+                # Confirmed sustained opportunity! Reset counter and proceed to enter
+                self.entry_candidate_ticks[token] = 0
+
+                self.logger().info(
+                    f"Best Combination: {connector_1} | {connector_2} | {trade_side} "
+                    f"Funding rate profitability: {expected_profitability:.4%} "
+                    f"Trading profitability after fees: {current_profitability:.4%} "
+                    f"Payback: {float(payback_hours):.1f}h (Limit: {float(max_allowed_payback):.1f}h)"
+                )
+
+                if self.config.dry_run:
+                    # Open Virtual Position in Sandbox
+                    fee_pct_1 = self.connectors[connector_1].get_fee(
+                        base_currency=trading_pair_1.split("-")[0],
+                        quote_currency=trading_pair_1.split("-")[1],
+                        order_type=OrderType.MARKET,
+                        order_side=TradeType.BUY,
+                        amount=pos_size / p1,
+                        price=p1,
+                        is_maker=False,
+                        position_action=PositionAction.OPEN
+                    ).percent
+                    fee_pct_2 = self.connectors[connector_2].get_fee(
+                        base_currency=trading_pair_2.split("-")[0],
+                        quote_currency=trading_pair_2.split("-")[1],
+                        order_type=OrderType.MARKET,
+                        order_side=TradeType.BUY,
+                        amount=pos_size / p2,
+                        price=p2,
+                        is_maker=False,
+                        position_action=PositionAction.OPEN
+                    ).percent
+
+                    eff_lev = self.get_effective_leverage(token, pos_size)
+                    self.active_funding_arbitrages[token] = {
+                        "is_virtual": True,
+                        "connector_1": connector_1,
+                        "connector_2": connector_2,
+                        "side": trade_side,
+                        "open_timestamp": self.current_timestamp,
+                        "price_1": p1,
+                        "price_2": p2,
+                        "amount_1": pos_size / p1,
+                        "amount_2": pos_size / p2,
+                        "position_size_quote": pos_size,
+                        "tier": int(self.get_token_tier(token)[0]),
+                        "leverage": eff_lev,
+                        "entry_fee_quote": (fee_pct_1 + fee_pct_2) * pos_size,
+                        "expected_profitability": expected_profitability,
+                        "entry_profitability_after_fees": current_profitability,
+                        "payback_hours": float(payback_hours),
+                        "entry_friction_pct": float(friction_pct),
+                        "funding_payments": [],
+                        "next_funding_time_1": funding_info_report[connector_1].next_funding_utc_timestamp,
+                        "next_funding_time_2": funding_info_report[connector_2].next_funding_utc_timestamp,
+                        "executors_ids": ["DRY_RUN_SANDBOX"],
+                    }
+                    self.entry_candidate_ticks.pop(token, None)
+                    self.logger().info(
+                        f"[DRY-RUN] Virtual Arbitrage Position Established for {token}!\n"
+                        f"  Leg 1 ({connector_1}): {'BUY' if trade_side == TradeType.BUY else 'SELL'} @ {p1:.4f}\n"
+                        f"  Leg 2 ({connector_2}): {'SELL' if trade_side == TradeType.BUY else 'BUY'} @ {p2:.4f}\n"
+                        f"  Notional Size: ${float(pos_size):,.2f} | Leverage: {eff_lev}x ({'Zero-Leverage Safe' if eff_lev == 1 else 'Capital Boost'})\n"
+                        f"  Daily Rate Diff: {expected_profitability:.4%}, Net Entry Spread: {current_profitability:.4%}"
+                    )
+                else:
+                    # Real Live Trading Executors
+                    eff_lev = self.get_effective_leverage(token, pos_size)
+                    self.logger().info(f"Starting live executors for {token} with dynamic size ${float(pos_size):,.2f} (Leverage: {eff_lev}x)...")
+                    position_executor_config_1, position_executor_config_2 = self.get_position_executors_config(
+                        token, connector_1, connector_2, trade_side, position_size_quote=pos_size
+                    )
+                    self.active_funding_arbitrages[token] = {
+                        "is_virtual": False,
+                        "connector_1": connector_1,
+                        "connector_2": connector_2,
+                        "executors_ids": [position_executor_config_1.id, position_executor_config_2.id],
+                        "side": trade_side,
+                        "open_timestamp": self.current_timestamp,
+                        "price_1": p1,
+                        "price_2": p2,
+                        "amount_1": pos_size / p1,
+                        "amount_2": pos_size / p2,
+                        "position_size_quote": pos_size,
+                        "tier": int(self.get_token_tier(token)[0]),
+                        "leverage": eff_lev,
+                        "expected_profitability": expected_profitability,
+                        "entry_profitability_after_fees": current_profitability,
+                        "funding_payments": [],
+                    }
+                    self.entry_candidate_ticks.pop(token, None)
+
+                    return [CreateExecutorAction(executor_config=position_executor_config_1),
+                            CreateExecutorAction(executor_config=position_executor_config_2)]
         return create_actions
 
     def _evaluate_token_quarantine(self, token: str, net_loss: float):
@@ -1404,6 +1534,11 @@ class FundingRateArbitrage(StrategyV2Base):
                     take_profit_target = Decimal(str(self.config.profitability_to_take_profit)) * pos_size
                     take_profit_condition = (not total_net_pnl.is_nan()) and (total_net_pnl > take_profit_target)
 
+                    # Defense 3: Basis Spread Divergence Stop-Loss (基差撕裂快速止损防线)
+                    trading_pnl_pct = trading_pnl / pos_size if pos_size > 0 else Decimal("0")
+                    max_basis_loss = Decimal(str(getattr(self.config, "max_basis_loss_pct", Decimal("0.005"))))
+                    basis_divergence_condition = (not trading_pnl_pct.is_nan()) and (trading_pnl_pct <= -max_basis_loss)
+
                     # Anti-Whipsaw Rate Inversion Filter (防假止损迟滞滤波)
                     funding_info_report = self.get_funding_info_by_token(token)
                     rate1 = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"])
@@ -1429,11 +1564,13 @@ class FundingRateArbitrage(StrategyV2Base):
                     liq_defense_condition, min_dist_pct, liq_buffer = self.evaluate_liquidation_defense(token, funding_arbitrage_info)
                     token_removed_condition = token not in self.config.tokens
 
-                    if take_profit_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
+                    if take_profit_condition or basis_divergence_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
                         if token_removed_condition:
                             reason = "Manual Rotation: Low Yield Ditch"
                         elif liq_defense_condition:
                             reason = f"Liquidation Defense (Safety Margin {float(min_dist_pct):.1%} <= {float(liq_buffer):.1%})"
+                        elif basis_divergence_condition:
+                            reason = f"Basis Spread Divergence Stop Loss (Trading PnL {float(trading_pnl_pct):.2%} <= -{float(max_basis_loss):.2%})"
                         elif take_profit_condition:
                             reason = "Take Profit"
                         elif current_funding_condition:
@@ -1484,6 +1621,11 @@ class FundingRateArbitrage(StrategyV2Base):
 
                     take_profit_condition = total_net_pnl > Decimal(str(self.config.profitability_to_take_profit)) * pos_size
 
+                    # Defense 3: Basis Spread Divergence Stop-Loss (基差撕裂快速止损防线)
+                    trading_pnl_pct = Decimal(str(executors_pnl)) / pos_size if pos_size > 0 else Decimal("0")
+                    max_basis_loss = Decimal(str(getattr(self.config, "max_basis_loss_pct", Decimal("0.005"))))
+                    basis_divergence_condition = (not trading_pnl_pct.is_nan()) and (trading_pnl_pct <= -max_basis_loss)
+
                     # Anti-Whipsaw Rate Inversion Filter
                     funding_info_report = self.get_funding_info_by_token(token)
                     rate1 = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"])
@@ -1509,11 +1651,13 @@ class FundingRateArbitrage(StrategyV2Base):
                     liq_defense_condition, min_dist_pct, liq_buffer = self.evaluate_liquidation_defense(token, funding_arbitrage_info)
                     token_removed_condition = token not in self.config.tokens
 
-                    if take_profit_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
+                    if take_profit_condition or basis_divergence_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
                         if token_removed_condition:
                             reason = "Manual Rotation: Low Yield Ditch"
                         elif liq_defense_condition:
                             reason = f"Liquidation Defense (Safety Margin {float(min_dist_pct):.1%} <= {float(liq_buffer):.1%})"
+                        elif basis_divergence_condition:
+                            reason = f"Basis Spread Divergence Stop Loss (Trading PnL {float(trading_pnl_pct):.2%} <= -{float(max_basis_loss):.2%})"
                         elif take_profit_condition:
                             reason = "Take Profit"
                         elif current_funding_condition:
