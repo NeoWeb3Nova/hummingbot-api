@@ -1,6 +1,9 @@
+import asyncio
+import json
 import math
 import os
 import time
+import urllib.request
 from decimal import Decimal
 from typing import Dict, List, Set, Tuple
 
@@ -54,7 +57,7 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
         }
     )
     profitability_to_take_profit: Decimal = Field(
-        default=0.01,
+        default=Decimal("0.02"),
         json_schema_extra={
             "prompt": lambda mi: "Enter the profitability to take profit (including PNL of positions and fundings received): ",
             "prompt_on_new": True}
@@ -202,6 +205,60 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
     tier_3_max_quote: Decimal = Field(
         default=Decimal("500.0"),
         json_schema_extra={"prompt": lambda mi: "Tier 3 micro-cap / meme tokens maximum position size quote (e.g. 500.0): ", "prompt_on_new": False}
+    )
+
+    # --- v1.3.0 Autonomous Universe Auto-Rotation Fields ---
+    auto_rotation_enabled: bool = Field(
+        default=True,
+        json_schema_extra={"prompt": lambda mi: "Enable autonomous token universe rotation? (True/False): ", "prompt_on_new": False}
+    )
+    auto_rotation_interval_minutes: int = Field(
+        default=30,
+        json_schema_extra={"prompt": lambda mi: "Interval in minutes between full market rotation checks (e.g. 30): ", "prompt_on_new": False}
+    )
+    auto_rotation_min_apr: float = Field(
+        default=0.35,
+        json_schema_extra={"prompt": lambda mi: "Minimum APR required for candidate tokens to enter universe (e.g. 0.35 for 35%): ", "prompt_on_new": False}
+    )
+    auto_rotation_min_apr_delta: float = Field(
+        default=0.40,
+        json_schema_extra={"prompt": lambda mi: "Minimum APR advantage over idle token to trigger rotation (e.g. 0.40 for 40%): ", "prompt_on_new": False}
+    )
+    auto_rotation_max_active_tokens: int = Field(
+        default=6,
+        json_schema_extra={"prompt": lambda mi: "Maximum number of tokens in active watchlist (e.g. 6): ", "prompt_on_new": False}
+    )
+    auto_rotation_min_volume_24h_usd: float = Field(
+        default=2000000.0,
+        json_schema_extra={"prompt": lambda mi: "Minimum 24h volume USD to qualify for auto-rotation (e.g. 2000000.0): ", "prompt_on_new": False}
+    )
+
+    # --- v1.3.0 Tier-Aware Dynamic Liquidation Buffers ---
+    tier_1_liquidation_buffer: Decimal = Field(
+        default=Decimal("0.04"),
+        json_schema_extra={"prompt": lambda mi: "Tier 1 liquidation safety buffer (e.g. 0.04 for 4%): ", "prompt_on_new": False}
+    )
+    tier_2_liquidation_buffer: Decimal = Field(
+        default=Decimal("0.08"),
+        json_schema_extra={"prompt": lambda mi: "Tier 2 liquidation safety buffer (e.g. 0.08 for 8%): ", "prompt_on_new": False}
+    )
+    tier_3_liquidation_buffer: Decimal = Field(
+        default=Decimal("0.12"),
+        json_schema_extra={"prompt": lambda mi: "Tier 3 liquidation safety buffer (e.g. 0.12 for 12%): ", "prompt_on_new": False}
+    )
+
+    # --- v1.3.0 Scaling-Out Take Profit Fields (Option B) ---
+    scaling_tp_enabled: bool = Field(
+        default=True,
+        json_schema_extra={"prompt": lambda mi: "Enable scaling-out tranche take profit? (True/False): ", "prompt_on_new": False}
+    )
+    partial_tp_ratio: Decimal = Field(
+        default=Decimal("0.50"),
+        json_schema_extra={"prompt": lambda mi: "Ratio of position to close on tranche 1 (e.g. 0.50 for 50%): ", "prompt_on_new": False}
+    )
+    partial_tp_threshold_pct: Decimal = Field(
+        default=Decimal("0.010"),
+        json_schema_extra={"prompt": lambda mi: "Net profit threshold on position to trigger tranche 1 (e.g. 0.010 for 1.0%): ", "prompt_on_new": False}
     )
 
     @field_validator("connectors", "tokens", "tier_1_tokens", "tier_2_tokens", mode="before")
@@ -444,6 +501,12 @@ class FundingRateArbitrage(StrategyV2Base):
         self.token_last_closed_timestamp: Dict[str, float] = {} # token -> float (timestamp of last closure)
         # Defense 1: Entry Hysteresis persistence counters
         self.entry_candidate_ticks: Dict[str, int] = {}     # token -> int (consecutive ticks meeting entry criteria)
+        # v1.3.0 Autonomous Auto-Rotation & Scaling TP Engine
+        self.rotation_event_history: List[Dict] = []
+        self.last_rotation_timestamp: float = 0.0
+        self._last_rotation_check_ts: float = 0.0
+        self._last_cmd_check_ts: float = 0.0
+        self.is_rotating: bool = False
 
     def get_token_tier(self, token: str) -> Tuple[int, Decimal]:
         """
@@ -560,12 +623,19 @@ class FundingRateArbitrage(StrategyV2Base):
                             "next_funding_time_1": int(ap.get("next_funding_1", 0)),
                             "next_funding_time_2": int(ap.get("next_funding_2", 0)),
                             "executors_ids": ap.get("executors_ids", ["DRY_RUN_SANDBOX"]),
+                            "partial_tp_executed": bool(ap.get("partial_tp_executed", False)),
+                            "locked_tp_pnl": float(ap.get("locked_tp_pnl", 0.0)),
                         }
                         self.logger().info(
                             f"[REHYDRATE] Restored active position for {t}: "
-                            f"{side_val} | Size: ${float(pos_size):,.2f} | Leverage: {eff_lev}x | Open: {open_ts}"
+                            f"{side_val} | Size: ${float(pos_size):,.2f} | Leverage: {eff_lev}x | Partial TP: {ap.get('partial_tp_executed', False)}"
                         )
-                self.logger().info("[ROTATION] Loaded historical closed trades and rehydrated active positions.")
+                # Rehydrate rotation status history
+                rot_status = saved_info.get("rotation_status", {})
+                if rot_status:
+                    self.rotation_event_history = rot_status.get("rotation_events", [])
+                    self.last_rotation_timestamp = float(rot_status.get("last_rotation_timestamp", 0.0))
+                self.logger().info("[ROTATION] Loaded historical closed trades, rotation events, and rehydrated active positions.")
                 # Auto-initialize quarantine ledger for tokens with heavy historical net deficit
                 for t_name, t_trades in self.stopped_funding_arbitrages.items():
                     if t_trades:
@@ -638,6 +708,10 @@ class FundingRateArbitrage(StrategyV2Base):
 
     def on_tick(self):
         if self.ready_to_trade and self.market_data_provider.ready and not getattr(self, "_is_stop_triggered", False):
+            # v1.3.0 Strategy Commands Listener & Auto-Rotation
+            self.check_strategy_commands()
+            self.check_universe_auto_rotation()
+
             actions = self.determine_executor_actions()
             for action in actions:
                 self.executor_orchestrator.execute_action(action)
@@ -664,6 +738,324 @@ class FundingRateArbitrage(StrategyV2Base):
                         f"[SCAN] Monitoring funding spreads (Min threshold: {thresh_pct:+.4f}%/day). "
                         f"Current spreads: [{', '.join(spread_info)}]. Waiting for spread to exceed threshold."
                     )
+
+    def check_strategy_commands(self):
+        """
+        Poll and execute real-time commands from Dashboard UI (Zero-Downtime Hot Control Channel).
+        """
+        now = self.current_timestamp
+        if now - getattr(self, "_last_cmd_check_ts", 0.0) < 2.0:
+            return
+        self._last_cmd_check_ts = now
+
+        cmd_path = "/home/hummingbot/data/strategy_commands.json"
+        if os.path.exists(cmd_path):
+            try:
+                with open(cmd_path, "r") as f:
+                    cmd = json.load(f)
+                os.remove(cmd_path)
+                self.logger().info(f"[COMMAND] Received strategy command from Dashboard: {cmd}")
+                act = cmd.get("action")
+                if act == "add_token":
+                    t = cmd.get("token")
+                    if t:
+                        asyncio.create_task(self.async_add_token(t))
+                elif act == "remove_token":
+                    t = cmd.get("token")
+                    if t:
+                        asyncio.create_task(self.async_remove_token(t))
+                elif act == "trigger_rotation":
+                    asyncio.create_task(self.run_universe_auto_rotation(force=True))
+                elif act == "clear_quarantine":
+                    t = cmd.get("token")
+                    if t and t in self.token_quarantine_ledger:
+                        del self.token_quarantine_ledger[t]
+                        self.logger().info(f"[COMMAND] Cleared quarantine for {t}")
+            except Exception as e:
+                self.logger().warning(f"[COMMAND] Failed processing strategy command: {e}")
+
+    def check_universe_auto_rotation(self):
+        """
+        Periodically evaluate cross-exchange perpetual universe and rotate stale idle tokens.
+        """
+        if not getattr(self.config, "auto_rotation_enabled", True):
+            return
+        if getattr(self, "is_rotating", False):
+            return
+        now = self.current_timestamp
+        interval_sec = float(getattr(self.config, "auto_rotation_interval_minutes", 30)) * 60.0
+        if not hasattr(self, "_last_rotation_check_ts") or self._last_rotation_check_ts == 0.0:
+            # On startup, give 60s for connectors to establish streams before initial scan
+            self._last_rotation_check_ts = now - interval_sec + 60.0
+        if now - self._last_rotation_check_ts >= interval_sec:
+            self._last_rotation_check_ts = now
+            asyncio.create_task(self.run_universe_auto_rotation(force=False))
+
+    async def async_add_token(self, token: str) -> bool:
+        """
+        Dynamically add a token to connector WebSocket streams and strategy watchlist without restart.
+        """
+        token = self.get_canonical_token(token).upper()
+        if token in self.config.tokens:
+            self.logger().info(f"[DYNAMIC-MARKET] Token {token} already in active watchlist.")
+            return True
+        self.logger().info(f"[DYNAMIC-MARKET] Dynamically mounting token {token} to connectors...")
+        for c_name in self.connectors:
+            connector = self.connectors[c_name]
+            pair = self.get_trading_pair_for_connector(token, c_name)
+            if hasattr(connector, "add_trading_pair"):
+                try:
+                    success = await connector.add_trading_pair(pair)
+                    if not success:
+                        self.logger().warning(f"[DYNAMIC-MARKET] Connector {c_name} reported failure adding {pair}")
+                        return False
+                except Exception as e:
+                    self.logger().warning(f"[DYNAMIC-MARKET] Error adding {pair} on {c_name}: {e}")
+                    return False
+        if isinstance(self.config.tokens, list):
+            self.config.tokens.append(token)
+        elif isinstance(self.config.tokens, set):
+            self.config.tokens.add(token)
+        self.stopped_funding_arbitrages.setdefault(token, [])
+        self.logger().info(f"[DYNAMIC-MARKET] Successfully mounted {token} to watchlist: {list(self.config.tokens)}")
+        self._sync_tokens_to_config_files()
+        return True
+
+    async def async_remove_token(self, token: str) -> bool:
+        """
+        Dynamically remove a token from active watchlist and unregister from connectors if no active position.
+        """
+        token = self.get_canonical_token(token).upper()
+        self.logger().info(f"[DYNAMIC-MARKET] Requesting dynamic removal of token {token}...")
+        if token in self.config.tokens:
+            if isinstance(self.config.tokens, list):
+                self.config.tokens.remove(token)
+            elif isinstance(self.config.tokens, set):
+                self.config.tokens.discard(token)
+        if token not in self.active_funding_arbitrages:
+            for c_name in self.connectors:
+                connector = self.connectors[c_name]
+                pair = self.get_trading_pair_for_connector(token, c_name)
+                if hasattr(connector, "remove_trading_pair"):
+                    try:
+                        await connector.remove_trading_pair(pair)
+                    except Exception as e:
+                        self.logger().warning(f"[DYNAMIC-MARKET] Error unmounting {pair} on {c_name}: {e}")
+            self.logger().info(f"[DYNAMIC-MARKET] Successfully unmounted market {token} from connectors")
+        else:
+            self.logger().info(f"[DYNAMIC-MARKET] Token {token} has active position; market will remain mounted until graceful exit completes.")
+        self._sync_tokens_to_config_files()
+        return True
+
+    def _sync_tokens_to_config_files(self):
+        """
+        Persist dynamic token universe modifications to YAML config file so restarts stay 100% in sync.
+        """
+        conf_paths = [
+            "/home/hummingbot/conf/scripts/funding_arb_hyperliquid_binance_dry_run.yml",
+        ]
+        for conf_path in conf_paths:
+            if not os.path.exists(conf_path):
+                continue
+            try:
+                with open(conf_path, "r") as f:
+                    lines = f.readlines()
+                new_lines = []
+                in_tokens = False
+                tokens_written = False
+                for line in lines:
+                    if line.strip().startswith("tokens:"):
+                        in_tokens = True
+                        new_lines.append(line)
+                        for t in self.config.tokens:
+                            new_lines.append(f"- {t}\n")
+                        tokens_written = True
+                        continue
+                    if in_tokens:
+                        if line.strip().startswith("- "):
+                            continue
+                        else:
+                            in_tokens = False
+                    new_lines.append(line)
+                if tokens_written:
+                    with open(conf_path, "w") as f:
+                        f.writelines(new_lines)
+                    self.logger().info(f"[CONFIG-SYNC] Synchronized {len(self.config.tokens)} tokens to {conf_path}")
+            except Exception as e:
+                self.logger().warning(f"[CONFIG-SYNC] Failed updating tokens in {conf_path}: {e}")
+
+    async def run_universe_auto_rotation(self, force: bool = False):
+        """
+        Execute full market radar scan and rotate idle low-yield tokens to high-APR candidates.
+        """
+        if self.is_rotating:
+            return
+        self.is_rotating = True
+        try:
+            self.logger().info(f"[AUTO-ROTATION] Starting universe opportunity scan (force={force})...")
+            candidates = await asyncio.to_thread(self._fetch_market_rotation_candidates)
+            if not candidates:
+                self.logger().info("[AUTO-ROTATION] No viable cross-exchange market candidates found.")
+                return
+
+            min_apr = float(getattr(self.config, "auto_rotation_min_apr", 0.35))
+            min_delta = float(getattr(self.config, "auto_rotation_min_apr_delta", 0.40))
+            max_tokens = int(getattr(self.config, "auto_rotation_max_active_tokens", 6))
+
+            # Filter candidates above threshold and not quarantined
+            viable_candidates = [
+                c for c in candidates
+                if c["apr"] >= min_apr * 100.0
+                and c["token"] not in self.token_quarantine_ledger
+                and c["token"] not in self.config.tokens
+            ]
+
+            current_tokens = list(self.config.tokens)
+            idle_tokens = [t for t in current_tokens if t not in self.active_funding_arbitrages]
+
+            top_cand_preview = [f"{c['token']} ({c['apr']:+.1f}%)" for c in viable_candidates[:5]]
+            self.logger().info(
+                f"[AUTO-ROTATION] Watchlist: {len(current_tokens)} tokens (Idle: {idle_tokens}). "
+                f"Top viable candidates: {top_cand_preview}"
+            )
+
+            # 1. If watchlist is below max_tokens, simply add top candidate
+            if len(current_tokens) < max_tokens and viable_candidates:
+                cand = viable_candidates.pop(0)
+                success = await self.async_add_token(cand["token"])
+                if success:
+                    event = {
+                        "timestamp": int(self.current_timestamp),
+                        "retired_token": "NONE (Slot Expansion)",
+                        "retired_apr": 0.0,
+                        "added_token": cand["token"],
+                        "added_apr": cand["apr"],
+                        "apr_delta": cand["apr"],
+                        "reason": f"Slot Expansion: Added high-yield candidate {cand['token']} ({cand['apr']:+.1f}% APR)"
+                    }
+                    self.rotation_event_history.insert(0, event)
+                    self.rotation_event_history = self.rotation_event_history[:25]
+                    self.last_rotation_timestamp = self.current_timestamp
+                    return
+
+            # 2. Check if an idle token should be rotated out
+            idle_apr_map = {}
+            for t in idle_tokens:
+                if t in self.token_quarantine_ledger:
+                    idle_apr_map[t] = -9999.0
+                    continue
+                try:
+                    f_rep = self.get_funding_info_by_token(t)
+                    best = self.get_most_profitable_combination(f_rep)
+                    idle_apr_map[t] = (best[3] * 365.0 * 100.0) if best else 0.0
+                except Exception:
+                    idle_apr_map[t] = 0.0
+
+            sorted_idle = sorted(idle_apr_map.keys(), key=lambda t: idle_apr_map[t])
+
+            for idle_tok in sorted_idle:
+                idle_apr = idle_apr_map[idle_tok]
+                if not viable_candidates:
+                    break
+                best_cand = viable_candidates[0]
+                cand_tok = best_cand["token"]
+                cand_apr = best_cand["apr"]
+                delta_apr = cand_apr - idle_apr
+
+                is_quarantined = (idle_tok in self.token_quarantine_ledger)
+                is_stale_low = (idle_apr < 5.0 and cand_apr >= min_apr * 100.0)
+                has_major_delta = (delta_apr >= min_delta * 100.0)
+
+                if is_quarantined or is_stale_low or has_major_delta or force:
+                    viable_candidates.pop(0)
+                    self.logger().info(
+                        f"[AUTO-ROTATION] Evicting idle token {idle_tok} (APR {idle_apr:+.1f}%) -> "
+                        f"Injecting candidate {cand_tok} (APR {cand_apr:+.1f}%, ΔAPR {delta_apr:+.1f}%)..."
+                    )
+                    await self.async_remove_token(idle_tok)
+                    success = await self.async_add_token(cand_tok)
+                    if success:
+                        reason_desc = (
+                            f"Quarantine Eviction ({idle_tok})" if is_quarantined else
+                            (f"Stale Low APR Eviction ({idle_tok} {idle_apr:+.1f}%)" if is_stale_low else
+                             f"Yield Super-Spread (ΔAPR {delta_apr:+.1f}%)")
+                        )
+                        event = {
+                            "timestamp": int(self.current_timestamp),
+                            "retired_token": idle_tok,
+                            "retired_apr": float(idle_apr),
+                            "added_token": cand_tok,
+                            "added_apr": float(cand_apr),
+                            "apr_delta": float(delta_apr),
+                            "reason": f"Auto-Rotation: {reason_desc} replaced by {cand_tok} ({cand_apr:+.1f}% APR)"
+                        }
+                        self.rotation_event_history.insert(0, event)
+                        self.rotation_event_history = self.rotation_event_history[:25]
+                        self.last_rotation_timestamp = self.current_timestamp
+                        self.logger().info(f"[AUTO-ROTATION] Completed rotation: {event['reason']}")
+                        break
+        except Exception as e:
+            self.logger().warning(f"[AUTO-ROTATION] Error during universe rotation: {e}")
+        finally:
+            self.is_rotating = False
+
+    def _fetch_market_rotation_candidates(self) -> List[Dict]:
+        """
+        Fetch all cross-exchange perpetuals from Binance and Hyperliquid REST APIs.
+        """
+        min_vol = float(getattr(self.config, "auto_rotation_min_volume_24h_usd", 2000000.0))
+        try:
+            # 1. Binance Ticker & PremiumIndex
+            t_req = urllib.request.Request("https://fapi.binance.com/fapi/v1/ticker/24hr", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(t_req, timeout=6) as r:
+                bn_tickers = {x["symbol"][:-4]: float(x.get("quoteVolume", 0)) for x in json.loads(r.read()) if x.get("symbol", "").endswith("USDT")}
+
+            p_req = urllib.request.Request("https://fapi.binance.com/fapi/v1/premiumIndex", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(p_req, timeout=6) as r:
+                bn_rates = {x["symbol"][:-4]: {"rate_daily": float(x.get("lastFundingRate", 0)) * 3.0, "price": float(x.get("markPrice", 0))} for x in json.loads(r.read()) if x.get("symbol", "").endswith("USDT")}
+
+            # 2. Hyperliquid Info
+            hl_req = urllib.request.Request(
+                "https://api.hyperliquid.xyz/info",
+                data=json.dumps({"type": "metaAndAssetCtxs"}).encode(),
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(hl_req, timeout=6) as r:
+                hl_data = json.loads(r.read())
+                universe = hl_data[0].get("universe", [])
+                ctxs = hl_data[1] if len(hl_data) > 1 else []
+                hl_rates = {}
+                for m, c in zip(universe, ctxs):
+                    coin = m.get("name")
+                    if coin:
+                        hl_rates[coin] = {
+                            "rate_daily": float(c.get("funding", 0)) * 24.0,
+                            "price": float(c.get("markPx", 0)),
+                            "vol_usd": float(c.get("dayNtlVlm", 0))
+                        }
+
+            # 3. Match cross-exchange pairs
+            results = []
+            for c, h in hl_rates.items():
+                if c in bn_rates and c in bn_tickers:
+                    b = bn_rates[c]
+                    b_vol = bn_tickers[c]
+                    if b["price"] > 0 and abs(h["price"] - b["price"]) / b["price"] <= 0.03:
+                        if b_vol >= min_vol and h["vol_usd"] >= 500000.0:
+                            diff = abs(h["rate_daily"] - b["rate_daily"])
+                            apr = diff * 365.0 * 100.0
+                            results.append({
+                                "token": c,
+                                "apr": apr,
+                                "daily_diff": diff * 100.0,
+                                "bn_vol": b_vol,
+                                "hl_vol": h["vol_usd"]
+                            })
+            results.sort(key=lambda x: x["apr"], reverse=True)
+            return results
+        except Exception as e:
+            self.logger().debug(f"[AUTO-ROTATION] Scanner fetch failed: {e}")
+            return []
 
     def publish_arbitrage_performance(self):
         """
@@ -739,10 +1131,17 @@ class FundingRateArbitrage(StrategyV2Base):
                 dist2_pct = (p2_curr - liq_p2) / p2_curr if p2_curr > 0 else Decimal("1")
 
             min_dist_pct = min(dist1_pct, dist2_pct)
+            t_tier = int(self.get_token_tier(token)[0])
+            if t_tier == 1:
+                req_buf = float(getattr(self.config, "tier_1_liquidation_buffer", Decimal("0.04")))
+            elif t_tier == 2:
+                req_buf = float(getattr(self.config, "tier_2_liquidation_buffer", Decimal("0.08")))
+            else:
+                req_buf = float(getattr(self.config, "tier_3_liquidation_buffer", Decimal("0.12")))
 
             active_list.append({
                 "token": token,
-                "tier": int(self.get_token_tier(token)[0]),
+                "tier": t_tier,
                 "connector_1": arb["connector_1"],
                 "connector_2": arb["connector_2"],
                 "side": arb["side"].name if hasattr(arb["side"], "name") else str(arb["side"]),
@@ -755,6 +1154,9 @@ class FundingRateArbitrage(StrategyV2Base):
                 "liq_distance_1_pct": float(dist1_pct),
                 "liq_distance_2_pct": float(dist2_pct),
                 "min_liq_distance_pct": float(min_dist_pct),
+                "liquidation_buffer_req_pct": req_buf,
+                "partial_tp_executed": bool(arb.get("partial_tp_executed", False)),
+                "locked_tp_pnl": float(arb.get("locked_tp_pnl", 0.0)),
                 "leverage": int(lev),
                 "long_leverage": int(lev),
                 "short_leverage": int(lev),
@@ -863,6 +1265,15 @@ class FundingRateArbitrage(StrategyV2Base):
                             "consecutive_losses": int(q.get("consecutive_losses", 0)),
                             "loss_amount": float(q.get("loss_amount", 0.0)),
                         } for tok, q in self.token_quarantine_ledger.items() if q.get("quarantine_until", 0) > self.current_timestamp
+                    },
+                    "rotation_status": {
+                        "auto_rotation_enabled": bool(getattr(self.config, "auto_rotation_enabled", True)),
+                        "last_rotation_timestamp": float(getattr(self, "last_rotation_timestamp", 0.0)),
+                        "next_rotation_timestamp": float(getattr(self, "_last_rotation_check_ts", 0.0) + getattr(self.config, "auto_rotation_interval_minutes", 30) * 60.0),
+                        "rotation_interval_minutes": int(getattr(self.config, "auto_rotation_interval_minutes", 30)),
+                        "min_apr_threshold": float(getattr(self.config, "auto_rotation_min_apr", 0.35)),
+                        "min_apr_delta": float(getattr(self.config, "auto_rotation_min_apr_delta", 0.40)),
+                        "rotation_events": getattr(self, "rotation_event_history", [])[:15],
                     },
                 }
             }
@@ -1476,7 +1887,16 @@ class FundingRateArbitrage(StrategyV2Base):
                 dist2_pct = (p2_curr - liq_p2) / p2_curr if p2_curr > 0 else Decimal("1")
 
             min_dist_pct = min(dist1_pct, dist2_pct)
-            liq_buffer = Decimal(str(getattr(self.config, "liquidation_buffer_pct", Decimal("0.08"))))
+            tier_val, _ = self.get_token_tier(token)
+            if tier_val == 1:
+                liq_buffer = Decimal(str(getattr(self.config, "tier_1_liquidation_buffer", Decimal("0.04"))))
+            elif tier_val == 2:
+                liq_buffer = Decimal(str(getattr(self.config, "tier_2_liquidation_buffer", Decimal("0.08"))))
+            else:
+                liq_buffer = Decimal(str(getattr(self.config, "tier_3_liquidation_buffer", Decimal("0.12"))))
+
+            funding_arbitrage_info["liquidation_buffer_pct"] = float(liq_buffer)
+            funding_arbitrage_info["safety_distance_pct"] = float(min_dist_pct)
             return (min_dist_pct <= liq_buffer), min_dist_pct, liq_buffer
         except Exception as e:
             self.logger().debug(f"Failed to evaluate liquidation defense for {token}: {e}")
@@ -1531,6 +1951,62 @@ class FundingRateArbitrage(StrategyV2Base):
                         total_net_pnl = Decimal("0")
                     total_pnl_pct = total_net_pnl / pos_size if pos_size > 0 else Decimal("0")
 
+                    # v1.3.0 Scaling-out Take Profit (Tranche 1: 50% locked on reaching +1.0% net profit)
+                    scaling_tp_enabled = getattr(self.config, "scaling_tp_enabled", True)
+                    partial_tp_ratio = Decimal(str(getattr(self.config, "partial_tp_ratio", Decimal("0.50"))))
+                    partial_tp_thresh = Decimal(str(getattr(self.config, "partial_tp_threshold_pct", Decimal("0.010"))))
+                    partial_tp_target = partial_tp_thresh * pos_size
+
+                    partial_tp_condition = (
+                        scaling_tp_enabled
+                        and not funding_arbitrage_info.get("partial_tp_executed", False)
+                        and (not total_net_pnl.is_nan())
+                        and (total_net_pnl >= partial_tp_target)
+                    )
+
+                    if partial_tp_condition:
+                        locked_trading_pnl = float(trading_pnl * partial_tp_ratio)
+                        locked_funding_pnl = float(funding_pnl * partial_tp_ratio)
+                        locked_net_pnl = float(total_net_pnl * partial_tp_ratio)
+
+                        partial_record = {
+                            "token": token,
+                            "connector_1": funding_arbitrage_info.get("connector_1", ""),
+                            "connector_2": funding_arbitrage_info.get("connector_2", ""),
+                            "close_reason": f"Partial Take Profit ({int(partial_tp_ratio * 100)}% Tranche Locked)",
+                            "close_timestamp": int(self.current_timestamp),
+                            "open_timestamp": int(funding_arbitrage_info.get("open_timestamp", self.current_timestamp)),
+                            "trading_pnl": locked_trading_pnl,
+                            "funding_pnl": locked_funding_pnl,
+                            "total_net_pnl": locked_net_pnl,
+                            "position_size": float(pos_size * partial_tp_ratio),
+                            "leverage": int(self.config.leverage),
+                            "close_price_1": float(p1_curr),
+                            "close_price_2": float(p2_curr),
+                            "open_price_1": float(funding_arbitrage_info.get("price_1", 0.0)),
+                            "open_price_2": float(funding_arbitrage_info.get("price_2", 0.0)),
+                            "duration_seconds": max(0, int(self.current_timestamp - funding_arbitrage_info.get("open_timestamp", self.current_timestamp))),
+                        }
+                        if token not in self.stopped_funding_arbitrages:
+                            self.stopped_funding_arbitrages[token] = []
+                        self.stopped_funding_arbitrages[token].append(partial_record)
+
+                        remaining_ratio = Decimal("1") - partial_tp_ratio
+                        funding_arbitrage_info["position_size_quote"] = float(pos_size * remaining_ratio)
+                        funding_arbitrage_info["amount_1"] = pos_size * remaining_ratio / p1_open if p1_open else Decimal("0")
+                        funding_arbitrage_info["amount_2"] = pos_size * remaining_ratio / p2_open if p2_open else Decimal("0")
+                        funding_arbitrage_info["partial_tp_executed"] = True
+                        funding_arbitrage_info["locked_tp_pnl"] = float(funding_arbitrage_info.get("locked_tp_pnl", 0.0)) + locked_net_pnl
+                        funding_arbitrage_info["funding_payments"] = [
+                            {"amount": float(p.get("amount", 0) * float(remaining_ratio)), "timestamp": p.get("timestamp", 0)}
+                            for p in funding_arbitrage_info.get("funding_payments", [])
+                        ]
+                        self.logger().info(
+                            f"[PARTIAL TAKE PROFIT] Locked {int(partial_tp_ratio * 100)}% profit for {token}!\n"
+                            f"  Locked Net PnL: ${locked_net_pnl:+.4f}, Remaining Position Size: ${funding_arbitrage_info['position_size_quote']:,.2f}"
+                        )
+                        pos_size = Decimal(str(funding_arbitrage_info["position_size_quote"]))
+
                     take_profit_target = Decimal(str(self.config.profitability_to_take_profit)) * pos_size
                     take_profit_condition = (not total_net_pnl.is_nan()) and (total_net_pnl > take_profit_target)
 
@@ -1572,7 +2048,7 @@ class FundingRateArbitrage(StrategyV2Base):
                         elif basis_divergence_condition:
                             reason = f"Basis Spread Divergence Stop Loss (Trading PnL {float(trading_pnl_pct):.2%} <= -{float(max_basis_loss):.2%})"
                         elif take_profit_condition:
-                            reason = "Take Profit"
+                            reason = "Take Profit (Final)" if funding_arbitrage_info.get("partial_tp_executed", False) else "Take Profit"
                         elif current_funding_condition:
                             reason = "Rate Inversion Stop Loss (费率持续倒挂止损)"
                         else:
@@ -1659,7 +2135,7 @@ class FundingRateArbitrage(StrategyV2Base):
                         elif basis_divergence_condition:
                             reason = f"Basis Spread Divergence Stop Loss (Trading PnL {float(trading_pnl_pct):.2%} <= -{float(max_basis_loss):.2%})"
                         elif take_profit_condition:
-                            reason = "Take Profit"
+                            reason = "Take Profit (Final)" if funding_arbitrage_info.get("partial_tp_executed", False) else "Take Profit"
                         elif current_funding_condition:
                             reason = "Rate Inversion Stop Loss (费率持续倒挂止损)"
                         else:
