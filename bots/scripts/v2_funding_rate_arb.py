@@ -120,6 +120,41 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": False,
         }
     )
+    token_quarantine_hours: Decimal = Field(
+        default=Decimal("24.0"),
+        json_schema_extra={
+            "prompt": lambda mi: "Hours to quarantine a toxic coin after heavy loss or consecutive stop losses (e.g. 24.0): ",
+            "prompt_on_new": False,
+        }
+    )
+    single_loss_quarantine_threshold: Decimal = Field(
+        default=Decimal("15.0"),
+        json_schema_extra={
+            "prompt": lambda mi: "Single trade loss USD threshold to trigger quarantine (e.g. 15.0): ",
+            "prompt_on_new": False,
+        }
+    )
+    rate_inversion_confirmation_ticks: int = Field(
+        default=3,
+        json_schema_extra={
+            "prompt": lambda mi: "Consecutive ticks of rate inversion required to confirm stop loss (e.g. 3): ",
+            "prompt_on_new": False,
+        }
+    )
+    reentry_cooldown_seconds: int = Field(
+        default=1800,
+        json_schema_extra={
+            "prompt": lambda mi: "Cooldown seconds before re-entering a recently closed token (e.g. 1800 for 30m): ",
+            "prompt_on_new": False,
+        }
+    )
+    max_entry_spread_friction_pct: Decimal = Field(
+        default=Decimal("0.005"),
+        json_schema_extra={
+            "prompt": lambda mi: "Max allowable entry friction (spread + fee discount) to open position (e.g. 0.005 for 0.5%): ",
+            "prompt_on_new": False,
+        }
+    )
 
 
 
@@ -355,6 +390,10 @@ class FundingRateArbitrage(StrategyV2Base):
         self.config = config
         self.active_funding_arbitrages = {}
         self.stopped_funding_arbitrages = {token: [] for token in self.config.tokens}
+        # v1.1.0 Institutional Risk Shields
+        self.token_quarantine_ledger: Dict[str, Dict] = {}  # token -> {"quarantine_until": float, "reason": str, "consecutive_losses": int}
+        self.inversion_tick_counter: Dict[str, int] = {}    # token -> int (ticks of sustained rate inversion)
+        self.token_last_closed_timestamp: Dict[str, float] = {} # token -> float (timestamp of last closure)
 
     def get_effective_leverage(self, token: str, position_size_quote: Decimal) -> int:
         """
@@ -415,6 +454,26 @@ class FundingRateArbitrage(StrategyV2Base):
                             "leverage": int(getattr(self.config, "leverage", 3)),
                         })
                 self.logger().info("[ROTATION] Loaded historical closed trades and retired inactive tokens.")
+                # Auto-initialize quarantine ledger for tokens with heavy or consecutive historical losses
+                for t_name, t_trades in self.stopped_funding_arbitrages.items():
+                    if t_trades:
+                        recent_losses = [p for p in t_trades if float(p.get("total_net_pnl", 0)) < 0]
+                        last_pnl = float(t_trades[-1].get("total_net_pnl", 0))
+                        loss_thresh = float(getattr(self.config, "single_loss_quarantine_threshold", Decimal("15.0")))
+                        quarantine_h = float(getattr(self.config, "token_quarantine_hours", Decimal("24.0")))
+                        if last_pnl < -loss_thresh or len(recent_losses) >= 2:
+                            loss_sum = float(sum(float(p.get('total_net_pnl', 0)) for p in recent_losses))
+                            self.token_quarantine_ledger[t_name] = {
+                                "quarantine_until": now_ts + quarantine_h * 3600,
+                                "reason": f"Historical Loss Deficit (${loss_sum:.2f})",
+                                "consecutive_losses": len(recent_losses),
+                                "loss_amount": loss_sum,
+                                "triggered_at": now_ts,
+                            }
+                            self.logger().warning(
+                                f"[QUARANTINE-INIT] Auto-quarantined token '{t_name}' due to heavy historical losses "
+                                f"(${loss_sum:.2f}) for {quarantine_h:.0f}h."
+                            )
         except Exception as e:
             self.logger().debug(f"Failed to load historical closed trades: {e}")
 
@@ -671,6 +730,16 @@ class FundingRateArbitrage(StrategyV2Base):
                     "active_positions": active_list,
                     "closed_trades": closed_list,
                     "market_comparison": market_list,
+                    "quarantined_tokens": {
+                        tok: {
+                            "quarantine_until": float(q.get("quarantine_until", 0)),
+                            "remaining_seconds": max(0, int(q.get("quarantine_until", 0) - self.current_timestamp)),
+                            "remaining_hours": max(0.0, float((q.get("quarantine_until", 0) - self.current_timestamp) / 3600.0)),
+                            "reason": str(q.get("reason", "Risk Quarantine")),
+                            "consecutive_losses": int(q.get("consecutive_losses", 0)),
+                            "loss_amount": float(q.get("loss_amount", 0.0)),
+                        } for tok, q in self.token_quarantine_ledger.items() if q.get("quarantine_until", 0) > self.current_timestamp
+                    },
                 }
             }
         }
@@ -804,10 +873,15 @@ class FundingRateArbitrage(StrategyV2Base):
             position_action=PositionAction.OPEN
         ).percent
 
+        m1 = Decimal(str(self.get_token_multiplier(token, connector_1)))
+        m2 = Decimal(str(self.get_token_multiplier(token, connector_2)))
+        p1_norm = connector_1_price / m1
+        p2_norm = connector_2_price / m2
+
         if side == TradeType.BUY:
-            estimated_trade_pnl_pct = (connector_2_price - connector_1_price) / connector_1_price
+            estimated_trade_pnl_pct = (p2_norm - p1_norm) / p1_norm
         else:
-            estimated_trade_pnl_pct = (connector_1_price - connector_2_price) / connector_2_price
+            estimated_trade_pnl_pct = (p1_norm - p2_norm) / p2_norm
         return estimated_trade_pnl_pct - estimated_fees_connector_1 - estimated_fees_connector_2
 
     def get_most_profitable_combination(self, funding_info_report: Dict):
@@ -942,6 +1016,31 @@ class FundingRateArbitrage(StrategyV2Base):
         create_actions = []
         for token in self.config.tokens:
             if token not in self.active_funding_arbitrages:
+                # 1. Toxic Asset Quarantine Check (拦截有毒重亏损资产)
+                quarantine_info = self.token_quarantine_ledger.get(token)
+                if quarantine_info:
+                    quarantine_until = quarantine_info.get("quarantine_until", 0)
+                    if self.current_timestamp < quarantine_until:
+                        remaining_m = (quarantine_until - self.current_timestamp) / 60
+                        self.logger().debug(
+                            f"[QUARANTINE-SKIP] Token '{token}' is quarantined for next {remaining_m:.1f}m. "
+                            f"Reason: {quarantine_info.get('reason')}."
+                        )
+                        continue
+                    else:
+                        self.logger().info(f"[QUARANTINE-RELEASE] Token '{token}' quarantine expired. Returned to active pool.")
+                        del self.token_quarantine_ledger[token]
+
+                # 2. Re-entry Cooldown Check (防假止损/频繁开关磨损)
+                last_closed = self.token_last_closed_timestamp.get(token, 0)
+                cooldown_sec = getattr(self.config, "reentry_cooldown_seconds", 1800)
+                if self.current_timestamp - last_closed < cooldown_sec:
+                    remaining_s = cooldown_sec - (self.current_timestamp - last_closed)
+                    self.logger().debug(
+                        f"[COOLDOWN-SKIP] Token '{token}' closed recently. In re-entry cooldown for {remaining_s:.0f}s."
+                    )
+                    continue
+
                 funding_info_report = self.get_funding_info_by_token(token)
                 best_combination = self.get_most_profitable_combination(funding_info_report)
                 if not best_combination:
@@ -979,6 +1078,15 @@ class FundingRateArbitrage(StrategyV2Base):
                             f"[PAYBACK-BARRIER] Token {token} entry friction {float(friction_pct):.3%} requires "
                             f"{float(payback_hours):.1f}h of funding to breakeven (limit: {float(max_allowed_payback):.1f}h). "
                             f"Skipping entry to protect capital from excessive spread."
+                        )
+                        continue
+
+                    # Mode 2: Hard Spread Friction Ceiling (流动性滑点与负基差硬天花板)
+                    max_entry_friction = Decimal(str(getattr(self.config, "max_entry_spread_friction_pct", Decimal("0.005"))))
+                    if friction_pct > max_entry_friction:
+                        self.logger().info(
+                            f"[SPREAD-FRICTION-BARRIER] Token {token} entry friction {float(friction_pct):.3%} exceeds "
+                            f"hard limit of {float(max_entry_friction):.2%}. Skipping entry to avoid illiquid slippage trap."
                         )
                         continue
 
@@ -1099,14 +1207,105 @@ class FundingRateArbitrage(StrategyV2Base):
                             "connector_2": connector_2,
                             "executors_ids": [position_executor_config_1.id, position_executor_config_2.id],
                             "side": trade_side,
+                            "open_timestamp": self.current_timestamp,
+                            "price_1": p1,
+                            "price_2": p2,
+                            "amount_1": pos_size / p1,
+                            "amount_2": pos_size / p2,
                             "position_size_quote": pos_size,
                             "leverage": eff_lev,
+                            "expected_profitability": expected_profitability,
+                            "entry_profitability_after_fees": current_profitability,
                             "funding_payments": [],
                         }
 
                         return [CreateExecutorAction(executor_config=position_executor_config_1),
                                 CreateExecutorAction(executor_config=position_executor_config_2)]
         return create_actions
+
+    def _evaluate_token_quarantine(self, token: str, net_loss: float):
+        """
+        Evaluate if a closed token should be quarantined due to severe loss or consecutive losses.
+        """
+        loss_thresh = float(getattr(self.config, "single_loss_quarantine_threshold", Decimal("15.0")))
+        quarantine_h = float(getattr(self.config, "token_quarantine_hours", Decimal("24.0")))
+
+        past_trades = self.stopped_funding_arbitrages.get(token, [])
+        consecutive_losses = 0
+        for tr in reversed(past_trades):
+            if float(tr.get("total_net_pnl", 0)) < 0:
+                consecutive_losses += 1
+            else:
+                break
+
+        should_quarantine = False
+        q_reason = ""
+        if net_loss < -loss_thresh:
+            should_quarantine = True
+            q_reason = f"Single Heavy Loss (${net_loss:.2f} < -${loss_thresh:.2f})"
+        elif consecutive_losses >= 2:
+            should_quarantine = True
+            q_reason = f"Consecutive Losses ({consecutive_losses} trades in a row)"
+
+        if should_quarantine:
+            self.token_quarantine_ledger[token] = {
+                "quarantine_until": self.current_timestamp + quarantine_h * 3600,
+                "reason": q_reason,
+                "consecutive_losses": consecutive_losses,
+                "triggered_at": self.current_timestamp,
+                "loss_amount": net_loss,
+            }
+            self.logger().warning(
+                f"🚨 [QUARANTINE-TRIGGER] Token '{token}' quarantined for {quarantine_h:.0f}h! "
+                f"Reason: {q_reason}."
+            )
+
+    def evaluate_liquidation_defense(self, token: str, funding_arbitrage_info: Dict) -> Tuple[bool, Decimal, Decimal]:
+        """
+        Calculates distance to liquidation for both legs and checks if liquidation buffer threshold is breached.
+        """
+        try:
+            trading_pair_1 = self.get_trading_pair_for_connector(token, funding_arbitrage_info["connector_1"])
+            trading_pair_2 = self.get_trading_pair_for_connector(token, funding_arbitrage_info["connector_2"])
+            pos_size = Decimal(str(funding_arbitrage_info.get("position_size_quote", self.config.position_size_quote)))
+            p1_open = Decimal(str(funding_arbitrage_info.get("price_1", 1)))
+            p2_open = Decimal(str(funding_arbitrage_info.get("price_2", 1)))
+
+            p1_curr = self.get_safe_quote_price(
+                connector_name=funding_arbitrage_info["connector_1"],
+                trading_pair=trading_pair_1,
+                quote_volume=pos_size,
+                is_buy=funding_arbitrage_info["side"] != TradeType.BUY,
+                fallback_price=p1_open,
+            )
+            p2_curr = self.get_safe_quote_price(
+                connector_name=funding_arbitrage_info["connector_2"],
+                trading_pair=trading_pair_2,
+                quote_volume=pos_size,
+                is_buy=funding_arbitrage_info["side"] == TradeType.BUY,
+                fallback_price=p2_open,
+            )
+
+            lev = Decimal(str(funding_arbitrage_info.get("leverage", self.get_effective_leverage(token, pos_size))))
+            mmr = Decimal("0.02")
+            is_buy_side = (funding_arbitrage_info["side"] == TradeType.BUY) if isinstance(funding_arbitrage_info["side"], TradeType) else (str(funding_arbitrage_info["side"]) in ["BUY", "TradeType.BUY"])
+            if is_buy_side:
+                liq_p1 = max(Decimal("0"), p1_open * (Decimal("1") - Decimal("1") / lev + mmr))
+                dist1_pct = (p1_curr - liq_p1) / p1_curr if p1_curr > 0 else Decimal("1")
+                liq_p2 = p2_open * (Decimal("1") + Decimal("1") / lev - mmr)
+                dist2_pct = (liq_p2 - p2_curr) / p2_curr if p2_curr > 0 else Decimal("1")
+            else:
+                liq_p1 = p1_open * (Decimal("1") + Decimal("1") / lev - mmr)
+                dist1_pct = (liq_p1 - p1_curr) / p1_curr if p1_curr > 0 else Decimal("1")
+                liq_p2 = max(Decimal("0"), p2_open * (Decimal("1") - Decimal("1") / lev + mmr))
+                dist2_pct = (p2_curr - liq_p2) / p2_curr if p2_curr > 0 else Decimal("1")
+
+            min_dist_pct = min(dist1_pct, dist2_pct)
+            liq_buffer = Decimal(str(getattr(self.config, "liquidation_buffer_pct", Decimal("0.08"))))
+            return (min_dist_pct <= liq_buffer), min_dist_pct, liq_buffer
+        except Exception as e:
+            self.logger().debug(f"Failed to evaluate liquidation defense for {token}: {e}")
+            return False, Decimal("1.0"), Decimal("0.08")
 
     def stop_actions_proposal(self) -> List[StopExecutorAction]:
         """
@@ -1160,6 +1359,7 @@ class FundingRateArbitrage(StrategyV2Base):
                     take_profit_target = Decimal(str(self.config.profitability_to_take_profit)) * pos_size
                     take_profit_condition = (not total_net_pnl.is_nan()) and (total_net_pnl > take_profit_target)
 
+                    # Anti-Whipsaw Rate Inversion Filter (防假止损迟滞滤波)
                     funding_info_report = self.get_funding_info_by_token(token)
                     rate1 = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"])
                     rate2 = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"])
@@ -1170,26 +1370,18 @@ class FundingRateArbitrage(StrategyV2Base):
 
                     diff_val = funding_rate_diff * self.funding_profitability_interval
                     stop_loss_target = Decimal(str(self.config.funding_rate_diff_stop_loss))
-                    current_funding_condition = (not diff_val.is_nan()) and (diff_val < stop_loss_target)
+                    raw_funding_inversion = (not diff_val.is_nan()) and (diff_val < stop_loss_target)
 
-                    # Liquidation Defense check
-                    lev = Decimal(str(funding_arbitrage_info.get("leverage", self.get_effective_leverage(token, pos_size))))
-                    mmr = Decimal("0.02")
-                    is_buy_side = (funding_arbitrage_info["side"] == TradeType.BUY) if isinstance(funding_arbitrage_info["side"], TradeType) else (str(funding_arbitrage_info["side"]) in ["BUY", "TradeType.BUY"])
-                    if is_buy_side:
-                        liq_p1 = max(Decimal("0"), p1_open * (Decimal("1") - Decimal("1") / lev + mmr))
-                        dist1_pct = (p1_curr - liq_p1) / p1_curr if p1_curr > 0 else Decimal("1")
-                        liq_p2 = p2_open * (Decimal("1") + Decimal("1") / lev - mmr)
-                        dist2_pct = (liq_p2 - p2_curr) / p2_curr if p2_curr > 0 else Decimal("1")
+                    required_ticks = int(getattr(self.config, "rate_inversion_confirmation_ticks", 3))
+                    if raw_funding_inversion:
+                        self.inversion_tick_counter[token] = self.inversion_tick_counter.get(token, 0) + 1
                     else:
-                        liq_p1 = p1_open * (Decimal("1") + Decimal("1") / lev - mmr)
-                        dist1_pct = (liq_p1 - p1_curr) / p1_curr if p1_curr > 0 else Decimal("1")
-                        liq_p2 = max(Decimal("0"), p2_open * (Decimal("1") - Decimal("1") / lev + mmr))
-                        dist2_pct = (p2_curr - liq_p2) / p2_curr if p2_curr > 0 else Decimal("1")
+                        self.inversion_tick_counter[token] = 0
 
-                    min_dist_pct = min(dist1_pct, dist2_pct)
-                    liq_buffer = Decimal(str(getattr(self.config, "liquidation_buffer_pct", 0.08)))
-                    liq_defense_condition = (min_dist_pct <= liq_buffer)
+                    current_funding_condition = (self.inversion_tick_counter.get(token, 0) >= required_ticks)
+
+                    # Liquidation Defense & Rotation checks
+                    liq_defense_condition, min_dist_pct, liq_buffer = self.evaluate_liquidation_defense(token, funding_arbitrage_info)
                     token_removed_condition = token not in self.config.tokens
 
                     if take_profit_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
@@ -1199,16 +1391,19 @@ class FundingRateArbitrage(StrategyV2Base):
                             reason = f"Liquidation Defense (Safety Margin {float(min_dist_pct):.1%} <= {float(liq_buffer):.1%})"
                         elif take_profit_condition:
                             reason = "Take Profit"
+                        elif current_funding_condition:
+                            reason = "Rate Inversion Stop Loss (费率持续倒挂止损)"
                         else:
                             reason = "Stop Loss"
+
                         self.logger().info(
                             f"[DRY-RUN] Virtual Arbitrage Closed ({reason}) for {token}!\n"
                             f"  Trading PnL: {trading_pnl:+.4f}, Funding PnL: {funding_pnl:+.4f}, Total Net PnL: {total_net_pnl:+.4f} ({total_pnl_pct:+.2%})"
                         )
                         funding_arbitrage_info["close_timestamp"] = self.current_timestamp
-                        funding_arbitrage_info["trading_pnl"] = trading_pnl
-                        funding_arbitrage_info["funding_pnl"] = funding_pnl
-                        funding_arbitrage_info["total_net_pnl"] = total_net_pnl
+                        funding_arbitrage_info["trading_pnl"] = float(trading_pnl)
+                        funding_arbitrage_info["funding_pnl"] = float(funding_pnl)
+                        funding_arbitrage_info["total_net_pnl"] = float(total_net_pnl)
                         funding_arbitrage_info["close_reason"] = reason
                         funding_arbitrage_info["close_price_1"] = float(p1_curr)
                         funding_arbitrage_info["close_price_2"] = float(p2_curr)
@@ -1218,6 +1413,12 @@ class FundingRateArbitrage(StrategyV2Base):
                         if token not in self.stopped_funding_arbitrages:
                             self.stopped_funding_arbitrages[token] = []
                         self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
+
+                        # Cooldown & Quarantine Ledger
+                        self.token_last_closed_timestamp[token] = self.current_timestamp
+                        self.inversion_tick_counter[token] = 0
+                        self._evaluate_token_quarantine(token, float(total_net_pnl))
+
                         del self.active_funding_arbitrages[token]
                 except Exception as e:
                     self.logger().warning(f"Error evaluating virtual stop condition for {token}: {e}")
@@ -1233,24 +1434,66 @@ class FundingRateArbitrage(StrategyV2Base):
                         for p in funding_arbitrage_info.get("funding_payments", [])
                     )
                     executors_pnl = sum(executor.net_pnl_quote for executor in executors)
-                    take_profit_condition = executors_pnl + funding_payments_pnl > self.config.profitability_to_take_profit * self.config.position_size_quote
+                    pos_size = Decimal(str(funding_arbitrage_info.get("position_size_quote", self.config.position_size_quote)))
+                    total_net_pnl = Decimal(str(executors_pnl)) + Decimal(str(funding_payments_pnl))
+
+                    take_profit_condition = total_net_pnl > Decimal(str(self.config.profitability_to_take_profit)) * pos_size
+
+                    # Anti-Whipsaw Rate Inversion Filter
                     funding_info_report = self.get_funding_info_by_token(token)
+                    rate1 = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"])
+                    rate2 = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"])
                     if funding_arbitrage_info["side"] == TradeType.BUY:
-                        funding_rate_diff = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"]) - self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"])
+                        funding_rate_diff = rate2 - rate1
                     else:
-                        funding_rate_diff = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"]) - self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"])
-                    current_funding_condition = funding_rate_diff * self.funding_profitability_interval < self.config.funding_rate_diff_stop_loss
-                    if take_profit_condition:
-                        self.logger().info("Take profit profitability reached, stopping executors")
+                        funding_rate_diff = rate1 - rate2
+
+                    diff_val = funding_rate_diff * self.funding_profitability_interval
+                    stop_loss_target = Decimal(str(self.config.funding_rate_diff_stop_loss))
+                    raw_funding_inversion = (not diff_val.is_nan()) and (diff_val < stop_loss_target)
+
+                    required_ticks = int(getattr(self.config, "rate_inversion_confirmation_ticks", 3))
+                    if raw_funding_inversion:
+                        self.inversion_tick_counter[token] = self.inversion_tick_counter.get(token, 0) + 1
+                    else:
+                        self.inversion_tick_counter[token] = 0
+
+                    current_funding_condition = (self.inversion_tick_counter.get(token, 0) >= required_ticks)
+
+                    # Liquidation Defense & Rotation checks
+                    liq_defense_condition, min_dist_pct, liq_buffer = self.evaluate_liquidation_defense(token, funding_arbitrage_info)
+                    token_removed_condition = token not in self.config.tokens
+
+                    if take_profit_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
+                        if token_removed_condition:
+                            reason = "Manual Rotation: Low Yield Ditch"
+                        elif liq_defense_condition:
+                            reason = f"Liquidation Defense (Safety Margin {float(min_dist_pct):.1%} <= {float(liq_buffer):.1%})"
+                        elif take_profit_condition:
+                            reason = "Take Profit"
+                        elif current_funding_condition:
+                            reason = "Rate Inversion Stop Loss (费率持续倒挂止损)"
+                        else:
+                            reason = "Stop Loss"
+
+                        self.logger().info(f"[LIVE] Arbitrage Closed ({reason}) for {token}! Stopping executors.")
+                        funding_arbitrage_info["close_timestamp"] = self.current_timestamp
+                        funding_arbitrage_info["trading_pnl"] = float(executors_pnl)
+                        funding_arbitrage_info["funding_pnl"] = float(funding_payments_pnl)
+                        funding_arbitrage_info["total_net_pnl"] = float(total_net_pnl)
+                        funding_arbitrage_info["close_reason"] = reason
+                        funding_arbitrage_info["duration_seconds"] = max(0, int(self.current_timestamp - funding_arbitrage_info.get("open_timestamp", self.current_timestamp)))
+
+                        if token not in self.stopped_funding_arbitrages:
+                            self.stopped_funding_arbitrages[token] = []
                         self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
-                        stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
-                    elif current_funding_condition:
-                        self.logger().info("Funding rate difference reached for stop loss, stopping executors")
-                        self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
-                        stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
-                    elif liq_defense_condition:
-                        self.logger().info(f"Liquidation safety distance reached ({float(min_dist_pct):.1%}), stopping executors for defense")
-                        self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
+
+                        # Cooldown & Quarantine Ledger
+                        self.token_last_closed_timestamp[token] = self.current_timestamp
+                        self.inversion_tick_counter[token] = 0
+                        self._evaluate_token_quarantine(token, float(total_net_pnl))
+
+                        del self.active_funding_arbitrages[token]
                         stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
                 except Exception as e:
                     self.logger().warning(f"Error evaluating live stop condition for {token}: {e}")
@@ -1380,5 +1623,18 @@ class FundingRateArbitrage(StrategyV2Base):
                                 f"Funding PnL: {pos.get('funding_pnl', 0):+.4f} | "
                                 f"Total Net: {pos.get('total_net_pnl', 0):+.4f}"
                             )
+
+            # Quarantined assets status
+            active_quarantined = {
+                tok: q for tok, q in self.token_quarantine_ledger.items()
+                if q.get("quarantine_until", 0) > self.current_timestamp
+            }
+            if active_quarantined:
+                funding_rate_status.append(f"\n--- 🛡️ Quarantined Toxic Assets ({len(active_quarantined)} active) ---")
+                for tok, q in active_quarantined.items():
+                    rem_min = (q["quarantine_until"] - self.current_timestamp) / 60
+                    funding_rate_status.append(
+                        f"  🚫 {tok}: Remaining {rem_min:.1f}m | Reason: {q.get('reason')} | Losses: {q.get('consecutive_losses', 1)}"
+                    )
 
         return original_status + "\n" + "\n".join(funding_rate_status)
