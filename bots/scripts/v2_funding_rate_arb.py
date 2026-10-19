@@ -1039,8 +1039,8 @@ class FundingRateArbitrage(StrategyV2Base):
             for c, h in hl_rates.items():
                 if c in bn_rates and c in bn_tickers:
                     b = bn_rates[c]
-                    b_vol = bn_tickers[c]
-                    if b["price"] > 0 and abs(h["price"] - b["price"]) / b["price"] <= 0.03:
+                    # Enforce strict 1.5% max price divergence to prevent entry friction trap and illiquid tokens
+                    if b["price"] > 0 and abs(h["price"] - b["price"]) / b["price"] <= 0.015:
                         if b_vol >= min_vol and h["vol_usd"] >= 500000.0:
                             diff = abs(h["rate_daily"] - b["rate_daily"])
                             apr = diff * 365.0 * 100.0
