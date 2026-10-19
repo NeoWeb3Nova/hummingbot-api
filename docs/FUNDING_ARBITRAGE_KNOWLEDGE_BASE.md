@@ -168,7 +168,16 @@ flowchart LR
   - **核心逻辑物理隔离**：将 700+ 行定制代码剥离为独立自包含组件（如 `frontend/components/funding_arbitrage_view.py`），使官方代码树对该文件无感知，实现冲突率 0%；
   - **极简插槽挂载**：官方原生文件（`app.py`）仅保留条件防护盾（`if is_funding_arb_bot`）与组件函数调用（Hook），压缩合并面；
   - **双源拓扑与自动化同步**：配置官方 `upstream` 远端仓库，并配合根目录运维工具 [`sync-upstream.sh`](file:///home/neo/projects/hummingbot/sync-upstream.sh) 实现一键自检与变基；
-  - **标准升级作业流程**：详见专题 SOP 文档 [`docs/UPSTREAM_UPGRADE_SOP.md`](file:///home/neo/projects/hummingbot/docs/UPSTREAM_UPGRADE_SOP.md)。
+### 13. 系统时间戳与时区偏差陷阱（UTC vs 本地时区显示与结算周期）
+- **现象**：用户在 Dashboard 监控持仓与平仓明细时，发现所有时间与本地钟表（如北京时间 / 上海时间）相差整整 8 个小时，容易误判平仓时刻或错过当期资金费结算窗口。
+- **根因**：
+  - 加密货币交易所与 Hummingbot 底层时间戳（Unix Epoch Timestamp）统一以 UTC 零时区存储；
+  - 前端原生代码使用 `pd.to_datetime(...)` 时未进行时区本地化转换，默认格式化为 UTC 朴素时间字符串。
+- **避坑准则与工程对策**：
+  - 封装统一的时区工具组件 [`timezone_utils.py`](file:///home/neo/projects/hummingbot/hummingbot-dashboard/frontend/components/timezone_utils.py)；
+  - **默认预置为北京时间 / 上海时间 (`Asia/Shanghai`, UTC+8)**，同时在前端顶部提供交互式时区切换下拉框（支持北京、UTC、东京、新加坡、美东、伦敦）；
+  - 在策略配置生成器（Config Generator）中开放时区字段（`timezone: "Asia/Shanghai"`），写入策略配置；
+  - 在持仓卡片中不仅展示相对倒计时，更清晰计算并展示下次结算的当地时钟时刻（例如 `币安 16:00:00 (北京时间)`），彻底消除时区认知混淆。
 
 ---
 
