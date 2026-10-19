@@ -106,6 +106,14 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": True,
         }
     )
+    min_leverage_capital_threshold: Decimal = Field(
+        default=Decimal("500.0"),
+        json_schema_extra={
+            "prompt": lambda mi: "Min capital threshold for applying leverage (below this size defaults to 1x safe mode, e.g. 500): ",
+            "prompt_on_new": False,
+        }
+    )
+
 
     @field_validator("connectors", "tokens", mode="before")
     @classmethod
@@ -196,6 +204,23 @@ class FundingRateArbitrage(StrategyV2Base):
         self.config = config
         self.active_funding_arbitrages = {}
         self.stopped_funding_arbitrages = {token: [] for token in self.config.tokens}
+
+    def get_effective_leverage(self, token: str, position_size_quote: Decimal) -> int:
+        """
+        专业动态杠杆引擎 (Dynamic Adaptive Leverage Engine):
+        1. 若全局配置为 1x，强制全额现货级对冲（零爆仓风险）；
+        2. 若单仓名义价值 <= min_leverage_capital_threshold (默认 $500)，自动降为 1x 免杠杆，
+           避免小资金产生单腿爆仓风险与频繁防御止损；
+        3. 若仓位规模充足 (> 阈值)，才启用目标杠杆（如 2x~3x）提升资金使用效率。
+        """
+        cfg_lev = max(1, int(getattr(self.config, "leverage", 3)))
+        if cfg_lev == 1:
+            return 1
+        threshold = Decimal(str(getattr(self.config, "min_leverage_capital_threshold", Decimal("500.0"))))
+        if position_size_quote <= threshold:
+            return 1
+        return cfg_lev
+
 
     def start(self, clock: Clock, timestamp: float) -> None:
         """
@@ -363,7 +388,7 @@ class FundingRateArbitrage(StrategyV2Base):
             elapsed_sec = max(0, now - arb.get("open_timestamp", now))
 
             # Calculate estimated liquidation price and safety margin distance
-            lev = Decimal(str(getattr(self.config, "leverage", 3)))
+            lev = Decimal(str(arb.get("leverage", self.get_effective_leverage(token, pos_size))))
             mmr = Decimal("0.02")  # ~2% maintenance margin ratio
             p1_open_val = Decimal(str(arb.get("price_1", p1_curr)))
             p2_open_val = Decimal(str(arb.get("price_2", p2_curr)))
@@ -532,7 +557,10 @@ class FundingRateArbitrage(StrategyV2Base):
                 position_mode = PositionMode.ONEWAY if connector_name == "hyperliquid_perpetual" else PositionMode.HEDGE
                 connector.set_position_mode(position_mode)
                 for trading_pair in self.market_data_provider.get_trading_pairs(connector_name):
-                    connector.set_leverage(trading_pair, self.config.leverage)
+                    token = trading_pair.split("-")[0]
+                    eff_lev = self.get_effective_leverage(token, self.config.position_size_quote)
+                    connector.set_leverage(trading_pair, eff_lev)
+
 
     def get_funding_info_by_token(self, token):
         """
@@ -857,6 +885,7 @@ class FundingRateArbitrage(StrategyV2Base):
                             position_action=PositionAction.OPEN
                         ).percent
 
+                        eff_lev = self.get_effective_leverage(token, pos_size)
                         self.active_funding_arbitrages[token] = {
                             "is_virtual": True,
                             "connector_1": connector_1,
@@ -868,6 +897,7 @@ class FundingRateArbitrage(StrategyV2Base):
                             "amount_1": pos_size / p1,
                             "amount_2": pos_size / p2,
                             "position_size_quote": pos_size,
+                            "leverage": eff_lev,
                             "entry_fee_quote": (fee_pct_1 + fee_pct_2) * pos_size,
                             "expected_profitability": expected_profitability,
                             "entry_profitability_after_fees": current_profitability,
@@ -882,12 +912,13 @@ class FundingRateArbitrage(StrategyV2Base):
                             f"[DRY-RUN] Virtual Arbitrage Position Established for {token}!\n"
                             f"  Leg 1 ({connector_1}): {'BUY' if trade_side == TradeType.BUY else 'SELL'} @ {p1:.4f}\n"
                             f"  Leg 2 ({connector_2}): {'SELL' if trade_side == TradeType.BUY else 'BUY'} @ {p2:.4f}\n"
-                            f"  Notional Size: ${float(pos_size):,.2f}\n"
+                            f"  Notional Size: ${float(pos_size):,.2f} | Leverage: {eff_lev}x ({'Zero-Leverage Safe' if eff_lev == 1 else 'Capital Boost'})\n"
                             f"  Daily Rate Diff: {expected_profitability:.4%}, Net Entry Spread: {current_profitability:.4%}"
                         )
                     else:
                         # Real Live Trading Executors
-                        self.logger().info(f"Starting live executors for {token} with dynamic size ${float(pos_size):,.2f}...")
+                        eff_lev = self.get_effective_leverage(token, pos_size)
+                        self.logger().info(f"Starting live executors for {token} with dynamic size ${float(pos_size):,.2f} (Leverage: {eff_lev}x)...")
                         position_executor_config_1, position_executor_config_2 = self.get_position_executors_config(
                             token, connector_1, connector_2, trade_side, position_size_quote=pos_size
                         )
@@ -898,8 +929,10 @@ class FundingRateArbitrage(StrategyV2Base):
                             "executors_ids": [position_executor_config_1.id, position_executor_config_2.id],
                             "side": trade_side,
                             "position_size_quote": pos_size,
+                            "leverage": eff_lev,
                             "funding_payments": [],
                         }
+
                         return [CreateExecutorAction(executor_config=position_executor_config_1),
                                 CreateExecutorAction(executor_config=position_executor_config_2)]
         return create_actions
@@ -969,7 +1002,7 @@ class FundingRateArbitrage(StrategyV2Base):
                     current_funding_condition = (not diff_val.is_nan()) and (diff_val < stop_loss_target)
 
                     # Liquidation Defense check
-                    lev = Decimal(str(getattr(self.config, "leverage", 3)))
+                    lev = Decimal(str(funding_arbitrage_info.get("leverage", self.get_effective_leverage(token, pos_size))))
                     mmr = Decimal("0.02")
                     is_buy_side = (funding_arbitrage_info["side"] == TradeType.BUY) if isinstance(funding_arbitrage_info["side"], TradeType) else (str(funding_arbitrage_info["side"]) in ["BUY", "TradeType.BUY"])
                     if is_buy_side:
@@ -1069,13 +1102,14 @@ class FundingRateArbitrage(StrategyV2Base):
         )
         position_amount = size / price
 
+        eff_lev = self.get_effective_leverage(token, size)
         position_executor_config_1 = PositionExecutorConfig(
             timestamp=self.current_timestamp,
             connector_name=connector_1,
             trading_pair=self.get_trading_pair_for_connector(token, connector_1),
             side=trade_side,
             amount=position_amount,
-            leverage=self.config.leverage,
+            leverage=eff_lev,
             triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
         )
         position_executor_config_2 = PositionExecutorConfig(
@@ -1084,9 +1118,10 @@ class FundingRateArbitrage(StrategyV2Base):
             trading_pair=self.get_trading_pair_for_connector(token, connector_2),
             side=TradeType.BUY if trade_side == TradeType.SELL else TradeType.SELL,
             amount=position_amount,
-            leverage=self.config.leverage,
+            leverage=eff_lev,
             triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
         )
+
         return position_executor_config_1, position_executor_config_2
 
     def format_status(self) -> str:
