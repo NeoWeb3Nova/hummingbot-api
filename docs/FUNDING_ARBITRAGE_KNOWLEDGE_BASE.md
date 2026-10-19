@@ -323,6 +323,35 @@ flowchart LR
   4. **漏洞三：开仓负基差摩擦硬天花板（Hard Spread Friction Barrier）**：
      - 无论资金费率多诱人（即使年化 1000%），若开仓摩擦成本（买卖点差 + 双边手续费）超过 `0.5%`（`max_entry_spread_friction_pct = 0.005`），系统坚决拒不开仓，彻底堵死 RSR 类冷门浅盘资产的滑点陷阱。
 
+### 20. 容器重启状态断点回补（State Rehydration）与隔离账本累计盈亏防御
+- **现场报错与异象复盘**：
+  - 用户反馈：“为什么突然之间活跃的多空持仓变成 0 了？但是变成 0 之后，历史平仓成交并没有增加，那几个标的怎么突然就不见了？”
+- **深层量化技术根因剖析**：
+  1. **内存状态丢失与缺失的回补分支（Missing State Rehydration Branch）**：
+     - 当容器为了热加载新版本策略代码执行重启时，策略类的 `__init__` 将 `self.active_funding_arbitrages` 初始化为空字典 `{}`。
+     - 策略启动函数 `start()` 会从本地持久化磁盘读取 `arbitrage_trades.json`。但先前的代码中，遍历 `active_positions` 列表时只有：
+       `if t and t not in self.config.tokens:`（用于淘汰旧币平仓入账），
+       **缺少了处理在配标的的 `else:` 分支**！
+     - 结果，本应继续运行的在配活跃持仓没有被灌回内存中的 `self.active_funding_arbitrages`；
+     - 启动仅 1 秒后，定时上报函数 `publish_arbitrage_performance` 执行，以内存中的空字典覆盖刷新了磁盘上的 `arbitrage_trades.json`，导致活跃持仓被刷为 `[]`。
+     - 因为这些仓位从未触发止盈止损，系统绝不会伪造平仓记录，所以历史平仓表数量不变，造成仓位“无声蒸发”的假象。
+  2. **隔离账本“只数负单次数”未算累计总盈亏的误杀漏洞（False Quarantine Bug）**：
+     - 原启动自检逻辑采用了 `recent_losses = [p for p in t_trades if float(p.get("total_net_pnl", 0)) < 0]`，若 `len(recent_losses) >= 2` 就无条件隔离 24 小时；
+     - **致命漏洞**：对于标的 **SAND**，历史 9 笔交易虽然有 6 笔微小止损（每次 -$3~$5），但其中有一笔单边基差收敛大胜锁定利润 **+$104.29**！该币历史**总累计净赚 +$79.65**！
+     - 原逻辑只数负单次数、完全忽略了历史总利润，导致系统重启后将这个主力赚钱优等生标的误判为“亏损毒币”，关入 24h 禁闭室。
+  3. **Python 字典默认实参预求值陷阱（Default Argument Eager Evaluation）**：
+     - 在反序列化恢复持仓时使用了 `ap.get("connector_1", self.config.connector_1)`；
+     - Python 在调用方法前会先行求值默认实参，而配置类仅定义了 `connectors: Set`，并未暴露 `connector_1` 独立属性，瞬间抛出 `AttributeError` 导致启动加载流程中断。
+- **v1.1.1 架构级防御与修复落地**：
+  1. **双向全状态无损断点回补（Bidirectional State Rehydration）**：
+     - 在 `start()` 中严密构建回水通道：不仅恢复名义金额、杠杆与双边开仓价，更一并完整恢复已履约的全部跨所资金费收息流水 `funding_payments`；
+     - 启动时日志明确打印 `[REHYDRATE] Restored active position for {token}`，实现容器重启秒级全状态自愈。
+  2. **累积总净收益率（Cumulative Realized PnL）真实核算防御**：
+     - 隔离触发器重构：只有当标的历史累计总净收益呈现真实净亏损（`cum_net_pnl < -loss_thresh`）且最近遭遇连亏或单笔巨亏时，才触发熔断隔离；
+     - 拥有正向累计收益的标的绝不误杀，守护盈利资产的持续做市机会。
+  3. **解耦实参防御**：
+     - 消除对象属性预求值，采用可靠的安全回退机制，确保加载链路高可用。
+
 ---
 
 ## 四、核心财务与风控数学指标手册
