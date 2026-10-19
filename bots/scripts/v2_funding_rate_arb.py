@@ -148,9 +148,138 @@ class FundingRateArbitrage(StrategyV2Base):
     }
     funding_profitability_interval = 60 * 60 * 24
 
+    canonical_token_registry = {
+        "PEPE": {
+            "binance_perpetual": {"symbol": "1000PEPE", "multiplier": 1000.0},
+            "hyperliquid_perpetual": {"symbol": "kPEPE", "multiplier": 1000.0},
+            "bybit_perpetual": {"symbol": "1000PEPE", "multiplier": 1000.0},
+        },
+        "BONK": {
+            "binance_perpetual": {"symbol": "1000BONK", "multiplier": 1000.0},
+            "hyperliquid_perpetual": {"symbol": "kBONK", "multiplier": 1000.0},
+            "bybit_perpetual": {"symbol": "1000BONK", "multiplier": 1000.0},
+        },
+        "SHIB": {
+            "binance_perpetual": {"symbol": "1000SHIB", "multiplier": 1000.0},
+            "hyperliquid_perpetual": {"symbol": "kSHIB", "multiplier": 1000.0},
+            "bybit_perpetual": {"symbol": "1000SHIB", "multiplier": 1000.0},
+        },
+        "FLOKI": {
+            "binance_perpetual": {"symbol": "1000FLOKI", "multiplier": 1000.0},
+            "hyperliquid_perpetual": {"symbol": "kFLOKI", "multiplier": 1000.0},
+            "bybit_perpetual": {"symbol": "1000FLOKI", "multiplier": 1000.0},
+        },
+        "LUNC": {
+            "binance_perpetual": {"symbol": "1000LUNC", "multiplier": 1000.0},
+            "hyperliquid_perpetual": {"symbol": "kLUNC", "multiplier": 1000.0},
+            "bybit_perpetual": {"symbol": "1000LUNC", "multiplier": 1000.0},
+        },
+        "NEIRO": {
+            "binance_perpetual": {"symbol": "NEIRO", "multiplier": 1.0},
+            "hyperliquid_perpetual": {"symbol": "kNEIRO", "multiplier": 1000.0},
+            "bybit_perpetual": {"symbol": "1000NEIRO", "multiplier": 1000.0},
+        },
+        "XEC": {
+            "binance_perpetual": {"symbol": "1000XEC", "multiplier": 1000.0},
+            "hyperliquid_perpetual": {"symbol": "kXEC", "multiplier": 1000.0},
+        },
+        "RATS": {
+            "binance_perpetual": {"symbol": "1000RATS", "multiplier": 1000.0},
+            "hyperliquid_perpetual": {"symbol": "kRATS", "multiplier": 1000.0},
+        },
+        "SATS": {
+            "binance_perpetual": {"symbol": "1000SATS", "multiplier": 1000.0},
+            "hyperliquid_perpetual": {"symbol": "kSATS", "multiplier": 1000.0},
+        },
+        "CAT": {
+            "binance_perpetual": {"symbol": "1000CAT", "multiplier": 1000.0},
+            "hyperliquid_perpetual": {"symbol": "kCAT", "multiplier": 1000.0},
+        },
+        "CHEEMS": {
+            "binance_perpetual": {"symbol": "1000CHEEMS", "multiplier": 1000.0},
+            "hyperliquid_perpetual": {"symbol": "kCHEEMS", "multiplier": 1000.0},
+        },
+        "WHY": {
+            "binance_perpetual": {"symbol": "1000WHY", "multiplier": 1000.0},
+            "hyperliquid_perpetual": {"symbol": "kWHY", "multiplier": 1000.0},
+        },
+        "MOG": {
+            "binance_perpetual": {"symbol": "1000000MOG", "multiplier": 1000000.0},
+            "hyperliquid_perpetual": {"symbol": "MOG", "multiplier": 1.0},
+        },
+    }
+
+    @classmethod
+    def get_canonical_token(cls, symbol: str, connector: str = "") -> str:
+        if not symbol:
+            return ""
+        raw_clean = symbol.strip().split("-")[0]
+        clean_sym = raw_clean.upper()
+        c_lower = (connector or "").lower()
+
+        # Check registry
+        for canon, conns in cls.canonical_token_registry.items():
+            for conn_key, data in conns.items():
+                if raw_clean == data["symbol"] or clean_sym == data["symbol"].upper():
+                    if not c_lower or conn_key.startswith(c_lower) or c_lower.startswith(conn_key.split("_")[0]):
+                        return canon
+
+        if clean_sym in cls.canonical_token_registry:
+            return clean_sym
+
+        # Heuristic: HL lowercase k-prefix
+        if raw_clean.startswith("k") and len(raw_clean) >= 4 and raw_clean[1:].isupper():
+            return raw_clean[1:]
+        if clean_sym.startswith("1000000") and len(clean_sym) > 7:
+            return clean_sym[7:]
+        if clean_sym.startswith("1000") and len(clean_sym) > 4:
+            return clean_sym[4:]
+        return clean_sym
+
+    @classmethod
+    def get_exchange_symbol(cls, token: str, connector: str) -> str:
+        canon = cls.get_canonical_token(token, connector)
+        c_lower = (connector or "").lower()
+        if canon in cls.canonical_token_registry:
+            conns = cls.canonical_token_registry[canon]
+            for conn_key, val in conns.items():
+                if conn_key in c_lower or c_lower.startswith(conn_key.split("_")[0]):
+                    return val["symbol"]
+
+        if "hyperliquid" in c_lower:
+            if canon in ["PEPE", "SHIB", "BONK", "FLOKI", "LUNC", "CAT", "CHEEMS"]:
+                return f"k{canon}"
+        elif "binance" in c_lower or "bybit" in c_lower:
+            if canon in ["PEPE", "SHIB", "BONK", "FLOKI", "LUNC", "CAT", "CHEEMS", "WHY", "RATS", "SATS", "XEC"]:
+                return f"1000{canon}"
+            if canon in ["MOG", "BOB"]:
+                return f"1000000{canon}"
+        return canon
+
+    @classmethod
+    def get_token_multiplier(cls, token: str, connector: str) -> float:
+        canon = cls.get_canonical_token(token, connector)
+        c_lower = (connector or "").lower()
+        if canon in cls.canonical_token_registry:
+            conns = cls.canonical_token_registry[canon]
+            for conn_key, val in conns.items():
+                if conn_key in c_lower or c_lower.startswith(conn_key.split("_")[0]):
+                    return float(val.get("multiplier", 1.0))
+
+        raw_clean = token.strip().split("-")[0]
+        if raw_clean.startswith("1000000"):
+            return 1000000.0
+        if raw_clean.startswith("1000"):
+            return 1000.0
+        if raw_clean.startswith("k") and len(raw_clean) >= 4 and raw_clean[1:].isupper():
+            return 1000.0
+        return 1.0
+
     @classmethod
     def get_trading_pair_for_connector(cls, token, connector):
-        return f"{token}-{cls.quote_markets_map.get(connector, 'USDT')}"
+        symbol = cls.get_exchange_symbol(token, connector)
+        quote = cls.quote_markets_map.get(connector, 'USDT')
+        return f"{symbol}-{quote}"
 
     @classmethod
     def init_markets(cls, config):
@@ -872,15 +1001,20 @@ class FundingRateArbitrage(StrategyV2Base):
                     )
 
                     # Asset Consistency & Price Divergence Circuit Breaker (同名不同币与假币强熔断防御)
-                    avg_p = (p1 + p2) / Decimal("2")
+                    m1 = Decimal(str(self.get_token_multiplier(token, connector_1)))
+                    m2 = Decimal(str(self.get_token_multiplier(token, connector_2)))
+                    p1_norm = p1 / m1
+                    p2_norm = p2 / m2
+                    avg_p = (p1_norm + p2_norm) / Decimal("2")
                     if avg_p > Decimal("0"):
-                        price_divergence = abs(p1 - p2) / avg_p
+                        price_divergence = abs(p1_norm - p2_norm) / avg_p
                         max_div = Decimal(str(getattr(self.config, "max_allowed_price_divergence", Decimal("0.03"))))
                         if price_divergence > max_div:
                             self.logger().warning(
-                                f"[ASSET-INTEGRITY-REJECT] Token '{token}' cross-exchange price divergence is {float(price_divergence):.2%} "
-                                f"({connector_1}: ${float(p1):.4f} vs {connector_2}: ${float(p2):.4f}), exceeding safe limit of {float(max_div):.1%}!\n"
-                                f"  Suspected homonym ticker collision (同名不同币), 1000x multiplier mismatch, or fake impostor asset. "
+                                f"[ASSET-INTEGRITY-REJECT] Token '{token}' cross-exchange normalized price divergence is {float(price_divergence):.2%} "
+                                f"({connector_1} raw:${float(p1):.4f}/norm:${float(p1_norm):.6f} vs {connector_2} raw:${float(p2):.4f}/norm:${float(p2_norm):.6f}), "
+                                f"exceeding safe limit of {float(max_div):.1%}!\n"
+                                f"  Suspected homonym ticker collision (同名不同币), unannounced token split/rebrand, or fake impostor asset. "
                                 f"Entry rejected immediately to protect capital!"
                             )
                             continue
@@ -1112,18 +1246,26 @@ class FundingRateArbitrage(StrategyV2Base):
         """
         Based on the funding payment event received (in live mode), check if one of the active arbitrages matches.
         """
-        token = funding_payment_completed_event.trading_pair.split("-")[0]
+        raw_token = funding_payment_completed_event.trading_pair.split("-")[0]
+        token = self.get_canonical_token(raw_token)
         if token in self.active_funding_arbitrages:
             self.active_funding_arbitrages[token]["funding_payments"].append(funding_payment_completed_event)
 
     def get_position_executors_config(self, token, connector_1, connector_2, trade_side, position_size_quote=None):
         size = Decimal(str(position_size_quote)) if position_size_quote is not None else self.config.position_size_quote
-        price = self.market_data_provider.get_price_by_type(
+        price_1 = self.market_data_provider.get_price_by_type(
             connector_name=connector_1,
             trading_pair=self.get_trading_pair_for_connector(token, connector_1),
             price_type=PriceType.MidPrice
         )
-        position_amount = size / price
+        amount_1 = size / price_1
+
+        price_2 = self.market_data_provider.get_price_by_type(
+            connector_name=connector_2,
+            trading_pair=self.get_trading_pair_for_connector(token, connector_2),
+            price_type=PriceType.MidPrice
+        )
+        amount_2 = size / price_2
 
         eff_lev = self.get_effective_leverage(token, size)
         position_executor_config_1 = PositionExecutorConfig(
@@ -1131,7 +1273,7 @@ class FundingRateArbitrage(StrategyV2Base):
             connector_name=connector_1,
             trading_pair=self.get_trading_pair_for_connector(token, connector_1),
             side=trade_side,
-            amount=position_amount,
+            amount=amount_1,
             leverage=eff_lev,
             triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
         )
@@ -1140,7 +1282,7 @@ class FundingRateArbitrage(StrategyV2Base):
             connector_name=connector_2,
             trading_pair=self.get_trading_pair_for_connector(token, connector_2),
             side=TradeType.BUY if trade_side == TradeType.SELL else TradeType.SELL,
-            amount=position_amount,
+            amount=amount_2,
             leverage=eff_lev,
             triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
         )
