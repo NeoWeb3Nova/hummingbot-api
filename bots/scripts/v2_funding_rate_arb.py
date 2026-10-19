@@ -230,8 +230,16 @@ class FundingRateArbitrage(StrategyV2Base):
         # Heuristic: HL lowercase k-prefix
         if raw_clean.startswith("k") and len(raw_clean) >= 4 and raw_clean[1:].isupper():
             return raw_clean[1:]
+        # dYdX '1k' prefix (e.g. 1kPEPE)
+        if clean_sym.startswith("1K") and len(clean_sym) > 3:
+            return clean_sym[2:]
+        # Binance / Bybit / Gate '1000000' prefix
         if clean_sym.startswith("1000000") and len(clean_sym) > 7:
             return clean_sym[7:]
+        # Bybit '10000' prefix (e.g. 10000LADYS)
+        if clean_sym.startswith("10000") and len(clean_sym) > 5:
+            return clean_sym[5:]
+        # Binance / Bybit / Bitget / KuCoin '1000' prefix
         if clean_sym.startswith("1000") and len(clean_sym) > 4:
             return clean_sym[4:]
         return clean_sym
@@ -249,7 +257,10 @@ class FundingRateArbitrage(StrategyV2Base):
         if "hyperliquid" in c_lower:
             if canon in ["PEPE", "SHIB", "BONK", "FLOKI", "LUNC", "CAT", "CHEEMS"]:
                 return f"k{canon}"
-        elif "binance" in c_lower or "bybit" in c_lower:
+        elif "dydx" in c_lower:
+            if canon in ["PEPE", "SHIB", "BONK"]:
+                return f"1k{canon}"
+        elif any(k in c_lower for k in ["binance", "bybit", "bitget", "kucoin"]):
             if canon in ["PEPE", "SHIB", "BONK", "FLOKI", "LUNC", "CAT", "CHEEMS", "WHY", "RATS", "SATS", "XEC"]:
                 return f"1000{canon}"
             if canon in ["MOG", "BOB"]:
@@ -267,9 +278,12 @@ class FundingRateArbitrage(StrategyV2Base):
                     return float(val.get("multiplier", 1.0))
 
         raw_clean = token.strip().split("-")[0]
-        if raw_clean.startswith("1000000"):
+        clean_sym = raw_clean.upper()
+        if clean_sym.startswith("1000000"):
             return 1000000.0
-        if raw_clean.startswith("1000"):
+        if clean_sym.startswith("10000"):
+            return 10000.0
+        if clean_sym.startswith("1000") or clean_sym.startswith("1K"):
             return 1000.0
         if raw_clean.startswith("k") and len(raw_clean) >= 4 and raw_clean[1:].isupper():
             return 1000.0

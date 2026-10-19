@@ -272,8 +272,22 @@ flowchart LR
      - 开仓前自动除以各自乘数进行单位归一化校验：
        $$\text{Divergence} = \frac{|P_1 / M_1 - P_2 / M_2|}{(P_1 / M_1 + P_2 / M_2) / 2} \le 3.0\%$$
        超过 3% 坚决拒开，防范分叉代币与同名假币；
-  5. **全流程官方终端外链穿透**：
-     - 在 [`frontend/components/market_links.py`](file:///home/neo/projects/hummingbot/hummingbot-dashboard/frontend/components/market_links.py) 中，`PEPE` 针对币安自动生成 `https://www.binance.com/zh-CN/futures/1000PEPEUSDT`，针对 Hyperliquid 自动生成 `https://app.hyperliquid.xyz/trade/kPEPE`，彻底根除 404 报错与非官方页面跳转。
+- **行业全主流交易所乘数与命名规则全景矩阵（Universal Multi-Exchange Matrix）**：
+  本系统设计的过滤与归一化规则是面向整个加密货币衍生品行业的**通用标准规范**，涵盖所有主流 CEX 与 DEX：
+  | 交易所 | 典型命名方式 | 乘数机制 (Multiplier) | 典型标的合约代码 | 策略处理与对冲逻辑 |
+  | :--- | :--- | :--- | :--- | :--- |
+  | **Binance (币安)** | 前缀数字 `1000` / `1000000` | 直接修改合约乘数 (1000x / 1M x) | `1000PEPEUSDT`, `1000000MOGUSDT` | 按代币数（Coins）直接挂单，名义货值精准对齐 |
+  | **Hyperliquid (DEX)** | 小写前缀 `k` | 1000x 乘数打包 | `kPEPE-USD`, `kSHIB-USD` | 智能区分小写 `k` 与正规币 `KAITO/KAS` |
+  | **Bybit** | 前缀 `1000` / `10000` / `1000000` | 阶梯乘数 (1000x / 10kx / 1Mx) | `1000PEPEUSDT`, `10000LADYSUSDT` | 启发式自动剥离前缀并恢复正确面额 |
+  | **Bitget** | 前缀 `1000` | 1000x 乘数 | `1000BONKUSDT`, `1000FLOKIUSDT` | 与币安/Bybit 算法无缝通用 |
+  | **KuCoin** | 前缀 `1000` + 后缀 `M` | 1000x 乘数 | `1000PEPEUSDTM`, `1000SHIBUSDTM` | 自动匹配标准资产，剔除计价后缀 |
+  | **dYdX (DEX)** | 前缀 `1k` | 1000x 乘数 | `1kPEPE-USD`, `1kSHIB-USD` | 启发式自动匹配 `1k` 模式 |
+  | **OKX (欧易)** | 保持原生代码，内置合约面值 `ctVal` | **面值张数模式 (1张 = 10,000,000币)** | `PEPE-USDT-SWAP` | **两腿解耦定额**：策略按盘口以美元定额除以价格，两腿货值永远绝对相等 |
+
+- **全交易所通用避险三大铁律（Industry Universal Invariants）**：
+  1. **资产中枢唯一性（Canonical Asset Singularity）**：任何交易所新增接入，只需映射至主资产代码（如 `PEPE`），零业务侵入；
+  2. **双腿名义货值绝对对等律（Notional Dollar Parity）**：无论交易所 A 是“张数（Contracts）”还是交易所 B 是“币数（Coins）”，两边永远以目标美元货值计算张数：$Amount_1 = Size / P_1, Amount_2 = Size / P_2$，彻底规避张数与币数混淆导致的千倍敞口；
+  3. **归一化价差前置强熔断（Cross-Exchange Price Divergence Barrier）**：任何两家交易所撮合开仓前，单位归一化价格偏差超过 3.0% 坚决拒开，拦截一切重名代币、迁移折价代币（如 `RNDR` vs `RENDER` 280% 偏差）或分叉劣质盘口。
 
 ---
 
