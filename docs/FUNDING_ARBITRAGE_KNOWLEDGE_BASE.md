@@ -179,6 +179,32 @@ flowchart LR
   - 在策略配置生成器（Config Generator）中开放时区字段（`timezone: "Asia/Shanghai"`），写入策略配置；
   - 在持仓卡片中不仅展示相对倒计时，更清晰计算并展示下次结算的当地时钟时刻（例如 `币安 16:00:00 (北京时间)`），彻底消除时区认知混淆。
 
+### 14. 高频量化时钟漂移与单腿拒单穿仓陷阱（Clock Skew & -1021 Naked Leg Trap）
+- **现象**：实盘或测试运行中，交易所 API 偶发抛出 `{"code": -1021, "msg": "Timestamp for this request was 1000ms ahead of the server's time."}` 或 `"Timestamp for this request is outside of the recvWindow."`。在开仓或平仓的关键瞬间，一腿（如 Hyperliquid）已经市价成交，另一腿（如币安）却因本地时钟滞后/超前被交易所拒单！导致原本对冲的无风险套利瞬间变成 **100% 单边暴露（裸奔风险）**，若遇单边行情极易发生巨额亏损甚至爆仓！
+- **根因**：
+  1. **交易所 API 防重放攻击严格校验**：主流交易所（Binance、Bybit 等）对所有私有签名请求强制校验 `timestamp` 与服务端时间差（默认限制在 `recvWindow=5000ms` 内，且多处严格限制时钟偏差绝对值 `< 1000ms`）；
+  2. **WSL2 / 虚拟化宿主机「休眠停滞大坑」**：在 Windows/Mac 笔记本或 PC 睡眠挂起时，WSL2 虚拟机的虚拟时钟会彻底停滞冻结！系统唤醒后，时钟不会自动快跳补齐，往往滞后数分钟至数小时；
+  3. **跨国 NTP 源高延迟与抖动**：Ubuntu 默认配置为海外 `ntp.ubuntu.com`（RTT 240ms+），导致本地时钟与币安服务器时常出现 -980ms ~ +500ms 的剧烈晃动，极易逼近 1000ms 拒单红线。
+- **避坑准则与工程对策**：
+  - **沉淀专用时钟诊断工具**：根目录新增 [`scripts/check-clock-sync.py`](file:///home/neo/projects/hummingbot/scripts/check-clock-sync.py)，一键精确探测与 Binance 合约服务器以及国内低延迟 NTP 源（阿里云/腾讯云，RTT < 40ms）的时间偏差；
+  - **前端实时时钟风控哨兵**：在 Dashboard 顶部集成 [`clock_monitor.py`](file:///home/neo/projects/hummingbot/hummingbot-dashboard/frontend/components/clock_monitor.py)，毫秒级检测时钟偏差。一旦绝对偏差超过 500ms，界面立即弹出醒目红色告警，从源头杜绝单腿拒单；
+  - **本地 WSL2 快速唤醒校准**：唤醒电脑后若发现时钟滞后，在终端执行 `sudo hwclock -s` 即可强制与硬件主板时钟瞬间同步；
+  - **替换为国内低延迟 NTP 源**：编辑 `/etc/systemd/timesyncd.conf`，将 NTP 服务器设置为 `ntp.aliyun.com ntp.tencent.com` 并重启服务；
+  - **生产 VPS 启用 Chrony 守护**：生产服务器必须启用 `chrony` 连续微调时钟服务（`sudo apt install -y chrony`），防止时钟跳变。
+
+### 15. 历史平仓成交全生命周期深度复盘与盈亏四维归因模型（Post-Mortem & Attribution Model）
+- **现象**：以往平仓记录仅有一张简陋数据表，缺乏对交易过程全生命周期的追踪。用户无法直观回答复盘 3 大核心问题：“为什么盈利？”、“为什么亏损？”、“持仓了多久，经历了什么？”。
+- **根因**：传统做市系统仅记录静态平仓 Net PnL 数字，缺乏对对冲套利内在因果（资金费现金流 vs 基差均值回归 vs 手续费摩擦 vs 费率倒挂防抽水止损 vs 强平垫防御）的结构化拆解与定性定理解释。
+- **避坑准则与工程对策**：
+  - **构建专用复盘归因引擎**：沉淀独立自包含组件 [`trade_attribution.py`](file:///home/neo/projects/hummingbot/hummingbot-dashboard/frontend/components/trade_attribution.py)；
+  - **四维结构化盈亏因果归因**：
+    1. **💰 资金费丰厚覆盖摩擦获利**：利息现金流不仅消化了开平仓滑点与手续费，还锁定了稳健正收益；
+    2. **📈 基差/价差收窄超额红利**：两所盘口价差均值回归带来额外盘口利润，加速达到止盈线；
+    3. **🛑 费率倒挂主动止损**：利差恶化跌破安全红线，策略坚决执行止损平仓，承担小额摩擦，杜绝反向抽水；
+    4. **🛡️ 强平安全垫防御退出**：极端单边脉冲导致单腿安全垫 ≤ 8%，主动双边平仓化解穿仓破产风险。
+  - **全生命周期时间线与对账展示**：精确统计持仓天/时/分，开平仓时间时区自动换算，提供真实实缴本金 ROE 与名义 APR 参考；
+  - **100% 官方复盘穿透直达**：在每个复盘展开卡片中配置交易所原生 K 线盘口、TradingView 全屏图表、CoinGlass 历史费率热力图按钮。
+
 ---
 
 ## 四、核心财务与风控数学指标手册

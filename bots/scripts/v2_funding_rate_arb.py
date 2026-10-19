@@ -444,6 +444,11 @@ class FundingRateArbitrage(StrategyV2Base):
                     "total_net_pnl": float(tot_pnl),
                     "position_size": float(p_size),
                     "leverage": int(self.config.leverage),
+                    "close_price_1": float(pos.get("close_price_1", 0.0)),
+                    "close_price_2": float(pos.get("close_price_2", 0.0)),
+                    "open_price_1": float(pos.get("price_1", 0.0)),
+                    "open_price_2": float(pos.get("price_2", 0.0)),
+                    "duration_seconds": int(pos.get("duration_seconds", max(0, int(pos.get("close_timestamp", 0)) - int(pos.get("open_timestamp", 0))))),
                 })
 
         # Live Market Comparison across watched tokens
@@ -1001,6 +1006,11 @@ class FundingRateArbitrage(StrategyV2Base):
                         funding_arbitrage_info["funding_pnl"] = funding_pnl
                         funding_arbitrage_info["total_net_pnl"] = total_net_pnl
                         funding_arbitrage_info["close_reason"] = reason
+                        funding_arbitrage_info["close_price_1"] = float(p1_curr)
+                        funding_arbitrage_info["close_price_2"] = float(p2_curr)
+                        funding_arbitrage_info["leg1_pnl"] = float(leg1_pnl)
+                        funding_arbitrage_info["leg2_pnl"] = float(leg2_pnl)
+                        funding_arbitrage_info["duration_seconds"] = max(0, int(self.current_timestamp - funding_arbitrage_info.get("open_timestamp", self.current_timestamp)))
                         if token not in self.stopped_funding_arbitrages:
                             self.stopped_funding_arbitrages[token] = []
                         self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
