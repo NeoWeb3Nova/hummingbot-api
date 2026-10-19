@@ -188,9 +188,13 @@ flowchart LR
 - **避坑准则与工程对策**：
   - **沉淀专用时钟诊断工具**：根目录新增 [`scripts/check-clock-sync.py`](file:///home/neo/projects/hummingbot/scripts/check-clock-sync.py)，一键精确探测与 Binance 合约服务器以及国内低延迟 NTP 源（阿里云/腾讯云，RTT < 40ms）的时间偏差；
   - **前端实时时钟风控哨兵**：在 Dashboard 顶部集成 [`clock_monitor.py`](file:///home/neo/projects/hummingbot/hummingbot-dashboard/frontend/components/clock_monitor.py)，毫秒级检测时钟偏差。一旦绝对偏差超过 500ms，界面立即弹出醒目红色告警，从源头杜绝单腿拒单；
-  - **本地 WSL2 快速唤醒校准**：唤醒电脑后若发现时钟滞后，在终端执行 `sudo hwclock -s` 即可强制与硬件主板时钟瞬间同步；
-  - **替换为国内低延迟 NTP 源**：编辑 `/etc/systemd/timesyncd.conf`，将 NTP 服务器设置为 `ntp.aliyun.com ntp.tencent.com` 并重启服务；
-  - **生产 VPS 启用 Chrony 守护**：生产服务器必须启用 `chrony` 连续微调时钟服务（`sudo apt install -y chrony`），防止时钟跳变。
+  - **警惕 `sudo hwclock -s` 覆写 NTP 陷阱**：
+    - `hwclock -s`（`--hctosys`）的作用是将主板硬件 RTC 时间写入系统时钟。但 WSL2 的虚拟 RTC 只有 1 秒精度且缺乏网络校准。如果在配置好 NTP 后执行 `sudo hwclock -s`，会**瞬间抹除 NTP 的毫秒精度**，导致系统时钟被硬拉回 1 秒前的粗糙时间！
+    - 更致命的是，`systemd-timesyncd` 在非启动状态下不会直接跳变（step），而是以约 50ppm（每秒 0.05ms）的微速慢漂（slew），消除 900ms 偏差需要漫长的 5 个多小时！
+  - **正确的即时校准操作**：
+    - 直接重启 timesyncd：`sudo systemctl restart systemd-timesyncd`（此时 timesyncd 会在启动时立即执行一次 step 毫秒级对齐；**切勿在其后执行 `sudo hwclock -s`**；如需将正确时间固化到硬件时钟，应使用 `sudo hwclock -w` 即 `--systohc`）；
+  - **生产 VPS 与量化交易终极推荐（Chrony）**：
+    - 在生产或 WSL2 中安装高精度时间守护神 `chrony`（`sudo apt install -y chrony`）。Chrony 默认配置 `makestep 0.1 3`，任何时钟偏差超过 100ms 均会立刻毫秒级跳变对齐，亦可通过 `sudo chronyc makestep` 瞬间强制对齐，是专业量化交易的唯一工业级标配。
 
 ### 15. 历史平仓成交全生命周期深度复盘与盈亏四维归因模型（Post-Mortem & Attribution Model）
 - **现象**：以往平仓记录仅有一张简陋数据表，缺乏对交易过程全生命周期的追踪。用户无法直观回答复盘 3 大核心问题：“为什么盈利？”、“为什么亏损？”、“持仓了多久，经历了什么？”。
