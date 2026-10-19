@@ -2,7 +2,7 @@ import math
 import os
 import time
 from decimal import Decimal
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 import pandas as pd
 from pydantic import Field, field_validator
