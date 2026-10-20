@@ -195,6 +195,7 @@ conf/
 improvements/
 features/
 bots/gateway-files/
+bots/data/
 .DS_Store
 Dockerfile.patched-hummingbot
 
