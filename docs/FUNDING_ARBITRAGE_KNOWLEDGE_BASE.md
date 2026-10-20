@@ -672,3 +672,8 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
 4. **VPS 实盘生产部署与安全自检**：
    - 生产环境迁移务必遵循亚太低延迟选址、Chrony 时钟毫秒同步、Tailscale 零暴露、API Key 固定 IP 白名单与 Docker 日志防爆等 6 大核心防线，详见专题指南 [`docs/VPS_PRODUCTION_DEPLOYMENT_GUIDE.md`](file:///home/neo/projects/hummingbot/docs/VPS_PRODUCTION_DEPLOYMENT_GUIDE.md)。
 
+
+
+## 2026-10-20：资金费模拟执行与财务口径审计
+
+参见 [审计修正记录](FUNDING_RATE_ARB_AUDIT_2026-10-20.md)。本次修复成交深度、四笔费用、数量配平、历史资金费、重启恢复和分所预算；实盘暂不开放。旧文档中的“1x 零爆仓”“筛掉历史亏损币证明长期盈利”等说法不成立。新记录优先解释这些修正，旧案例作为历史原文保留。
