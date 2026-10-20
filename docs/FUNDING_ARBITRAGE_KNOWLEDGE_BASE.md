@@ -555,6 +555,35 @@ flowchart LR
      - 支持「全量历史真实账本」与「🛡️ 剔除永久黑名单毒币」一键切换；
      - 剔除毒币后，系统真实造血能力瞬间显现：已实现利润达 **`+$136.01`**，利润因子高达 **`2.81x`**，均单胜负比达 **`9.5x`**！
 
+### Case 28: 基差统计套利加资金费双击流独立引擎与物理隔离架构 (Basis Stat Arb + Carry Double-Dip Engine) (v2.0.0)
+- **业务背景与痛点诉求**：
+  - 用户在审视纯资金费率套利（Funding Carry）后发现：在 limited capital（如 ~$4,300）且严格执行主流低滑点标准下，年化 25%~35% 的纯资金费收益每天仅约 $2.87，资金创收效率与周转速度相对有限；
+  - 历史复盘证明，系统中真正的超额暴利（如 AVAX +$102、BERA +$156、SAND +$104）本质上均是**两所盘口基差撕裂后的极速均值回归（Basis Mean-Reversion Windfall）**；
+  - 为实现日均创收能力的跨越式突破，系统正式落地**「基差统计套利加资金费双击流」新栏目**，同时满足严格的**“与既有纯资金费套利 100% 物理隔离、互不干涉、各走各的”**底线。
+- **四大维度物理隔离体系（Zero-Interference Guarantee）**：
+  1. **策略内核代码物理隔离**：
+     - 现有 `v2_funding_rate_arb.py` 维持 0 触碰、0 变更，确保长周期稳健吃息盘面不受任何扰动；
+     - 全新独立编写 `v2_basis_stat_arb.py`（继承 `StrategyV2Base`），专职 1 秒高频捕获盘口基差偏离脉冲（Basis Dislocation）；
+  2. **数据持久化账本物理隔离**：
+     - 现有资金费策略继续维护 `data/arbitrage_trades.json`；
+     - 新基差策略全生命周期独立读写 `data/basis_stat_arb_trades.json`，数据表、平仓历史与浮动仓位完全解耦，0 污染；
+  3. **运行进程与容器实例物理隔离**：
+     - 现役容器 `funding-arb-dryrun-neo-20261018-082007` 持续运行（Up 8+ hours）；
+     - 新增独立 Paper 测试实例容器 `basis-stat-arb-dryrun-neo-20261020-001`，具有专属内存空间、时钟循环、日志流与 MQTT 通道；
+  4. **前端交互与配置生成器物理隔离**：
+     - 在左侧导航栏【Config Generator】下正式开辟独立栏目：`⚡ Basis Stat Arb (基差统计套利)`（`frontend/pages/config/basis_stat_arb/app.py`）；
+     - 在【Instances】实例监控层，根据策略签名自动分支渲染专属独立透视看板（`frontend/components/basis_stat_arb_view.py`），提供基差均值回归进度条、多空脉冲雷达与独立财务战报。
+- **基差双击流量化核心运行机制**：
+  1. **标的池聚焦铁律（Tier 1 & Tier 2 Only）**：
+     - 坚决杜绝无做市商的劣质山寨币，严格锁定 BTC、ETH、SOL、AVAX、SUI、DOGE、NEAR、APT、ARB、OP、LINK 等顶级流动性做市币，确保搬砖资金必定在分钟级至小时级拉平价差；
+  2. **偏离脉冲入场（Dislocation Entry）**：
+     - 实时监测 $\Delta P = (P_{\text{HL}} - P_{\text{Binance}}) / P_{\text{Binance}}$；
+     - 当 $|\Delta P| \ge 0.70\%$ 且持续 2 个 Tick 确认时，判定做市商深度脱锚，自动“做空高估所 + 做多低估所”；
+     - 叠加资金费顺风校验（Double-Dip），在等待均值回归期间兼收多空利差；
+  3. **均值回归极速收割（Mean-Reversion TP）**：
+     - 基差一旦收敛至 $|\Delta P| \le 0.15\%$ 或综合净利润 $\ge +0.50\%$，立即双边平仓锁定利润（$1,500 仓位单笔净落袋 +$10~$20）；
+     - 配备 6 小时超时退避与 1.50% 恶性发散防爆止损，实现资金极速周转。
+
 ---
 
 ## 四、核心财务与风控数学指标手册
