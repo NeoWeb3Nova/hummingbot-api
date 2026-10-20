@@ -76,10 +76,31 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": True}
     )
     max_payback_hours: Decimal = Field(
-        default=Decimal("12.0"),
+        default=Decimal("24.0"),
         json_schema_extra={
-            "prompt": lambda mi: "Max payback hours to accept entry friction vs funding yield (e.g. 12.0): ",
+            "prompt": lambda mi: "Max payback hours to accept entry friction vs funding yield (e.g. 24.0): ",
             "prompt_on_new": True,
+        }
+    )
+    max_entry_spread_pct: Decimal = Field(
+        default=Decimal("0.0010"),
+        json_schema_extra={
+            "prompt": lambda mi: "Max allowed entry price divergence ratio between exchanges (e.g. 0.0010 for 0.10%): ",
+            "prompt_on_new": False,
+        }
+    )
+    duration_linked_holding_factor: float = Field(
+        default=2.5,
+        json_schema_extra={
+            "prompt": lambda mi: "Multiplier on payback hours to set minimum holding protection duration (e.g. 2.5): ",
+            "prompt_on_new": False,
+        }
+    )
+    min_holding_hours_floor: float = Field(
+        default=24.0,
+        json_schema_extra={
+            "prompt": lambda mi: "Absolute floor in hours for minimum holding lock (e.g. 24.0): ",
+            "prompt_on_new": False,
         }
     )
     dynamic_position_sizing: bool = Field(
@@ -683,6 +704,9 @@ class FundingRateArbitrage(StrategyV2Base):
                             "partial_tp_executed": bool(ap.get("partial_tp_executed", False)),
                             "locked_tp_pnl": float(ap.get("locked_tp_pnl", 0.0)),
                             "breakeven_active": bool(ap.get("breakeven_active", False)),
+                            "min_hold_hours": float(ap.get("min_hold_hours", 24.0)),
+                            "min_hold_until": float(ap.get("min_hold_until", 0.0)),
+                            "regime_tier": str(ap.get("regime_tier", "TIER_2_FARMING")),
                         }
                         self.logger().info(
                             f"[REHYDRATE] Restored active position for {t}: "
@@ -1006,11 +1030,12 @@ class FundingRateArbitrage(StrategyV2Base):
             min_delta = float(getattr(self.config, "auto_rotation_min_apr_delta", 0.40))
             max_tokens = int(getattr(self.config, "auto_rotation_max_active_tokens", 6))
 
-            # Filter candidates above threshold and not quarantined
+            # Filter candidates above threshold and not quarantined or permanently blacklisted
             viable_candidates = [
                 c for c in candidates
                 if c["apr"] >= min_apr * 100.0
                 and c["token"] not in self.token_quarantine_ledger
+                and c["token"] not in self.token_permanent_blacklist
                 and c["token"] not in self.config.tokens
             ]
 
@@ -1464,6 +1489,10 @@ class FundingRateArbitrage(StrategyV2Base):
                 "net_pnl_pct": float(net_position_pnl / pos_size) if pos_size else 0.0,
                 "duration_seconds": int(elapsed_sec),
                 "payback_hours": float(arb.get("payback_hours", 0.0)),
+                "min_hold_hours": float(arb.get("min_hold_hours", 24.0)),
+                "min_hold_until": float(arb.get("min_hold_until", 0.0)),
+                "remaining_hold_hours": max(0.0, float((arb.get("min_hold_until", 0.0) - self.current_timestamp) / 3600.0)),
+                "regime_tier": str(arb.get("regime_tier", "TIER_2_FARMING")),
                 "entry_spread_pct": float(arb.get("entry_profitability_after_fees", 0.0)),
                 "next_funding_1": int(arb.get("next_funding_time_1", 0)),
                 "next_funding_2": int(arb.get("next_funding_time_2", 0)),
@@ -2054,6 +2083,16 @@ class FundingRateArbitrage(StrategyV2Base):
                         self.entry_candidate_ticks[token] = 0
                         continue
 
+                # Mode 3: Tight Entry Spread Barrier (严防倒贴大基差入场)
+                max_entry_spread = Decimal(str(getattr(self.config, "max_entry_spread_pct", Decimal("0.0010"))))
+                if price_divergence > max_entry_spread:
+                    self.logger().info(
+                        f"[SPREAD-BARRIER] Token '{token}' entry price divergence {float(price_divergence):.3%} "
+                        f"exceeds limit {float(max_entry_spread):.2%}. Waiting for tighter spread alignment..."
+                    )
+                    self.entry_candidate_ticks[token] = 0
+                    continue
+
                 # Defense 1: Entry Hysteresis & Persistence Filter (开仓迟滞滤波 / 连续 N 次 Tick 确认)
                 req_ticks = int(getattr(self.config, "entry_persistence_ticks", 3))
                 self.entry_candidate_ticks[token] = self.entry_candidate_ticks.get(token, 0) + 1
@@ -2098,6 +2137,13 @@ class FundingRateArbitrage(StrategyV2Base):
                     ).percent
 
                     eff_lev = Decimal("1") if is_probationary else self.get_effective_leverage(token, pos_size)
+                    payback_h_val = float(payback_hours)
+                    hold_factor = float(getattr(self.config, "duration_linked_holding_factor", 2.5))
+                    min_hold_floor = float(getattr(self.config, "min_holding_hours_floor", 24.0))
+                    min_hold_h = max(min_hold_floor, payback_h_val * hold_factor)
+                    min_hold_ts = self.current_timestamp + min_hold_h * 3600.0
+                    regime_tier = "TIER_1_SURFING" if (payback_h_val <= 8.0 and expected_profitability * 365 >= Decimal("0.80")) else "TIER_2_FARMING"
+
                     self.active_funding_arbitrages[token] = {
                         "is_virtual": True,
                         "connector_1": connector_1,
@@ -2115,7 +2161,10 @@ class FundingRateArbitrage(StrategyV2Base):
                         "entry_fee_quote": (fee_pct_1 + fee_pct_2) * pos_size,
                         "expected_profitability": expected_profitability,
                         "entry_profitability_after_fees": current_profitability,
-                        "payback_hours": float(payback_hours),
+                        "payback_hours": payback_h_val,
+                        "min_hold_hours": min_hold_h,
+                        "min_hold_until": min_hold_ts,
+                        "regime_tier": regime_tier,
                         "entry_friction_pct": float(friction_pct),
                         "funding_payments": [],
                         "next_funding_time_1": funding_info_report[connector_1].next_funding_utc_timestamp,
@@ -2126,16 +2175,24 @@ class FundingRateArbitrage(StrategyV2Base):
                         self.probationary_tokens[token]["probe_executed"] = True
                     self.entry_candidate_ticks.pop(token, None)
                     self.logger().info(
-                        f"[DRY-RUN] Virtual Arbitrage Position Established for {token}!\n"
+                        f"[DRY-RUN] Virtual Arbitrage Position Established for {token} [{regime_tier}]!\n"
                         f"  Leg 1 ({connector_1}): {'BUY' if trade_side == TradeType.BUY else 'SELL'} @ {p1:.4f}\n"
                         f"  Leg 2 ({connector_2}): {'SELL' if trade_side == TradeType.BUY else 'BUY'} @ {p2:.4f}\n"
                         f"  Notional Size: ${float(pos_size):,.2f} | Leverage: {eff_lev}x ({'Zero-Leverage Safe Probe' if eff_lev == 1 else 'Capital Boost'})\n"
-                        f"  Daily Rate Diff: {expected_profitability:.4%}, Net Entry Spread: {current_profitability:.4%}"
+                        f"  Daily Rate Diff: {expected_profitability:.4%}, Net Entry Spread: {current_profitability:.4%}\n"
+                        f"  Payback: {payback_h_val:.1f}h | Duration Protection Lock: {min_hold_h:.1f}h"
                     )
                 else:
                     # Real Live Trading Executors
                     eff_lev = Decimal("1") if is_probationary else self.get_effective_leverage(token, pos_size)
-                    self.logger().info(f"Starting live executors for {token} with dynamic size ${float(pos_size):,.2f} (Leverage: {eff_lev}x)...")
+                    payback_h_val = float(payback_hours)
+                    hold_factor = float(getattr(self.config, "duration_linked_holding_factor", 2.5))
+                    min_hold_floor = float(getattr(self.config, "min_holding_hours_floor", 24.0))
+                    min_hold_h = max(min_hold_floor, payback_h_val * hold_factor)
+                    min_hold_ts = self.current_timestamp + min_hold_h * 3600.0
+                    regime_tier = "TIER_1_SURFING" if (payback_h_val <= 8.0 and expected_profitability * 365 >= Decimal("0.80")) else "TIER_2_FARMING"
+
+                    self.logger().info(f"Starting live executors for {token} [{regime_tier}] with dynamic size ${float(pos_size):,.2f} (Leverage: {eff_lev}x, Hold Lock: {min_hold_h:.1f}h)...")
                     position_executor_config_1, position_executor_config_2 = self.get_position_executors_config(
                         token, connector_1, connector_2, trade_side, position_size_quote=pos_size
                     )
@@ -2156,6 +2213,10 @@ class FundingRateArbitrage(StrategyV2Base):
                         "is_probationary_probe": is_probationary,
                         "expected_profitability": expected_profitability,
                         "entry_profitability_after_fees": current_profitability,
+                        "payback_hours": payback_h_val,
+                        "min_hold_hours": min_hold_h,
+                        "min_hold_until": min_hold_ts,
+                        "regime_tier": regime_tier,
                         "funding_payments": [],
                     }
                     if is_probationary and token in self.probationary_tokens:
@@ -2447,6 +2508,16 @@ class FundingRateArbitrage(StrategyV2Base):
                     # Liquidation Defense & Rotation checks
                     liq_defense_condition, min_dist_pct, liq_buffer = self.evaluate_liquidation_defense(token, funding_arbitrage_info)
                     token_removed_condition = token not in self.config.tokens
+                    # v1.6.0 Duration-Linked Holding Lock: Protect position from voluntary rotation churning
+                    now_ts = self.current_timestamp
+                    min_hold_until = float(funding_arbitrage_info.get("min_hold_until", 0.0))
+                    if token_removed_condition and (now_ts < min_hold_until):
+                        token_removed_condition = False
+                        rem_h = max(0.0, (min_hold_until - now_ts) / 3600.0)
+                        self.logger().debug(
+                            f"[DURATION-LOCK] Token '{token}' voluntary rotation blocked by duration lock. "
+                            f"Remaining protection: {rem_h:.1f}h"
+                        )
 
                     if take_profit_condition or breakeven_stop_condition or basis_divergence_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
                         if token_removed_condition:
@@ -2578,6 +2649,16 @@ class FundingRateArbitrage(StrategyV2Base):
                     # Liquidation Defense & Rotation checks
                     liq_defense_condition, min_dist_pct, liq_buffer = self.evaluate_liquidation_defense(token, funding_arbitrage_info)
                     token_removed_condition = token not in self.config.tokens
+                    # v1.6.0 Duration-Linked Holding Lock: Protect position from voluntary rotation churning
+                    now_ts = self.current_timestamp
+                    min_hold_until = float(funding_arbitrage_info.get("min_hold_until", 0.0))
+                    if token_removed_condition and (now_ts < min_hold_until):
+                        token_removed_condition = False
+                        rem_h = max(0.0, (min_hold_until - now_ts) / 3600.0)
+                        self.logger().debug(
+                            f"[DURATION-LOCK] Token '{token}' voluntary rotation blocked by duration lock. "
+                            f"Remaining protection: {rem_h:.1f}h"
+                        )
 
                     if take_profit_condition or breakeven_stop_condition or basis_divergence_condition or current_funding_condition or liq_defense_condition or token_removed_condition:
                         if token_removed_condition:
