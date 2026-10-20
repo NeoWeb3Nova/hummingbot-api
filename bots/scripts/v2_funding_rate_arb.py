@@ -167,9 +167,16 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
         }
     )
     max_basis_loss_pct: Decimal = Field(
-        default=Decimal("0.005"),
+        default=Decimal("0.012"),
         json_schema_extra={
-            "prompt": lambda mi: "Max allowed trading PnL basis loss ratio before emergency cut (e.g. 0.005 for 0.5%): ",
+            "prompt": lambda mi: "Max allowed trading net loss ratio before emergency cut (e.g. 0.012 for 1.2%): ",
+            "prompt_on_new": False,
+        }
+    )
+    basis_divergence_confirmation_ticks: int = Field(
+        default=5,
+        json_schema_extra={
+            "prompt": lambda mi: "Consecutive ticks of basis divergence required to confirm stop loss (e.g. 5): ",
             "prompt_on_new": False,
         }
     )
@@ -555,6 +562,8 @@ class FundingRateArbitrage(StrategyV2Base):
         self.probationary_tokens: Dict[str, Dict] = {}      # token -> {"admitted_ts": float, "probe_size": float, "status": str, "reason": str}
         self._last_graduation_check_ts: float = 0.0
         self.is_evaluating_graduation: bool = False
+        # v1.5.1 Basis Divergence Hysteresis Persistence
+        self.basis_divergence_tick_counter: Dict[str, int] = {}
 
     def get_token_tier(self, token: str) -> Tuple[int, Decimal]:
         """
@@ -2396,10 +2405,23 @@ class FundingRateArbitrage(StrategyV2Base):
                         and (total_pnl_pct <= be_stop)
                     )
 
-                    # Defense 3: Basis Spread Divergence Stop-Loss (基差撕裂快速止损防线)
-                    trading_pnl_pct = trading_pnl / pos_size if pos_size > 0 else Decimal("0")
-                    max_basis_loss = Decimal(str(getattr(self.config, "max_basis_loss_pct", Decimal("0.005"))))
-                    basis_divergence_condition = (not trading_pnl_pct.is_nan()) and (trading_pnl_pct <= -max_basis_loss)
+                    # Defense 3: Basis Spread Divergence Stop-Loss (基差撕裂与综合净亏损双重确认防线)
+                    # 综合净盈亏总账原则：考量扣除已收利息后的真实净收益率，并施加持续确认滤波防洗盘
+                    net_loss_pct = total_net_pnl / pos_size if pos_size > 0 else Decimal("0")
+                    max_basis_loss = Decimal(str(getattr(self.config, "max_basis_loss_pct", Decimal("0.012"))))
+                    raw_basis_breach = (not net_loss_pct.is_nan()) and (net_loss_pct <= -max_basis_loss)
+
+                    req_basis_ticks = int(getattr(self.config, "basis_divergence_confirmation_ticks", 5))
+                    if raw_basis_breach:
+                        self.basis_divergence_tick_counter[token] = self.basis_divergence_tick_counter.get(token, 0) + 1
+                        self.logger().warning(
+                            f"[BASIS-ALERT] Token '{token}' net deficit reached {float(net_loss_pct):.2%} "
+                            f"(<= -{float(max_basis_loss):.2%}). Hysteresis persistence: {self.basis_divergence_tick_counter[token]}/{req_basis_ticks} ticks."
+                        )
+                    else:
+                        self.basis_divergence_tick_counter[token] = 0
+
+                    basis_divergence_condition = (self.basis_divergence_tick_counter.get(token, 0) >= req_basis_ticks)
 
                     # Anti-Whipsaw Rate Inversion Filter (防假止损迟滞滤波)
                     funding_info_report = self.get_funding_info_by_token(token)
@@ -2432,7 +2454,7 @@ class FundingRateArbitrage(StrategyV2Base):
                         elif liq_defense_condition:
                             reason = f"Liquidation Defense (Safety Margin {float(min_dist_pct):.1%} <= {float(liq_buffer):.1%})"
                         elif basis_divergence_condition:
-                            reason = f"Basis Spread Divergence Stop Loss (Trading PnL {float(trading_pnl_pct):.2%} <= -{float(max_basis_loss):.2%})"
+                            reason = f"Basis Spread Divergence Stop Loss (Net PnL {float(net_loss_pct):.2%} <= -{float(max_basis_loss):.2%} for {req_basis_ticks} ticks)"
                         elif breakeven_stop_condition:
                             reason = f"Breakeven Trailing Stop (Retracement {float(total_pnl_pct):+.2%} <= +{float(be_stop):.2%})"
                         elif take_profit_condition:
@@ -2463,6 +2485,7 @@ class FundingRateArbitrage(StrategyV2Base):
                         # Cooldown & Quarantine Ledger
                         self.token_last_closed_timestamp[token] = self.current_timestamp
                         self.inversion_tick_counter[token] = 0
+                        self.basis_divergence_tick_counter[token] = 0
                         if token in self.probationary_tokens or funding_arbitrage_info.get("is_probationary_probe"):
                             self._handle_probation_result(token, float(total_net_pnl), reason)
                         else:
@@ -2513,10 +2536,23 @@ class FundingRateArbitrage(StrategyV2Base):
                         and (total_pnl_pct <= be_stop)
                     )
 
-                    # Defense 3: Basis Spread Divergence Stop-Loss (基差撕裂快速止损防线)
-                    trading_pnl_pct = Decimal(str(executors_pnl)) / pos_size if pos_size > 0 else Decimal("0")
-                    max_basis_loss = Decimal(str(getattr(self.config, "max_basis_loss_pct", Decimal("0.005"))))
-                    basis_divergence_condition = (not trading_pnl_pct.is_nan()) and (trading_pnl_pct <= -max_basis_loss)
+                    # Defense 3: Basis Spread Divergence Stop-Loss (基差撕裂与综合净亏损双重确认防线)
+                    # 综合净盈亏总账原则：考量扣除已收利息后的真实净收益率，并施加持续确认滤波防洗盘
+                    net_loss_pct = total_net_pnl / pos_size if pos_size > 0 else Decimal("0")
+                    max_basis_loss = Decimal(str(getattr(self.config, "max_basis_loss_pct", Decimal("0.012"))))
+                    raw_basis_breach = (not net_loss_pct.is_nan()) and (net_loss_pct <= -max_basis_loss)
+
+                    req_basis_ticks = int(getattr(self.config, "basis_divergence_confirmation_ticks", 5))
+                    if raw_basis_breach:
+                        self.basis_divergence_tick_counter[token] = self.basis_divergence_tick_counter.get(token, 0) + 1
+                        self.logger().warning(
+                            f"[BASIS-ALERT] Token '{token}' net deficit reached {float(net_loss_pct):.2%} "
+                            f"(<= -{float(max_basis_loss):.2%}). Hysteresis persistence: {self.basis_divergence_tick_counter[token]}/{req_basis_ticks} ticks."
+                        )
+                    else:
+                        self.basis_divergence_tick_counter[token] = 0
+
+                    basis_divergence_condition = (self.basis_divergence_tick_counter.get(token, 0) >= req_basis_ticks)
 
                     # Anti-Whipsaw Rate Inversion Filter
                     funding_info_report = self.get_funding_info_by_token(token)
@@ -2549,7 +2585,7 @@ class FundingRateArbitrage(StrategyV2Base):
                         elif liq_defense_condition:
                             reason = f"Liquidation Defense (Safety Margin {float(min_dist_pct):.1%} <= {float(liq_buffer):.1%})"
                         elif basis_divergence_condition:
-                            reason = f"Basis Spread Divergence Stop Loss (Trading PnL {float(trading_pnl_pct):.2%} <= -{float(max_basis_loss):.2%})"
+                            reason = f"Basis Spread Divergence Stop Loss (Net PnL {float(net_loss_pct):.2%} <= -{float(max_basis_loss):.2%} for {req_basis_ticks} ticks)"
                         elif breakeven_stop_condition:
                             reason = f"Breakeven Trailing Stop (Retracement {float(total_pnl_pct):+.2%} <= +{float(be_stop):.2%})"
                         elif take_profit_condition:
@@ -2574,6 +2610,7 @@ class FundingRateArbitrage(StrategyV2Base):
                         # Cooldown & Quarantine Ledger
                         self.token_last_closed_timestamp[token] = self.current_timestamp
                         self.inversion_tick_counter[token] = 0
+                        self.basis_divergence_tick_counter[token] = 0
                         if token in self.probationary_tokens or funding_arbitrage_info.get("is_probationary_probe"):
                             self._handle_probation_result(token, float(total_net_pnl), reason)
                         else:
