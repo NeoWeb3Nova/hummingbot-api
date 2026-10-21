@@ -50,3 +50,14 @@
 用户要求清理不再使用的部署容器。已删除被新版替代、且处于停止状态的 `funding-arb-audited-paper-neo-20261020-130322` 与 `funding-arb-dryrun-neo-20261018-082007`，使用精确容器 ID，不强制停止任何进程、不删除卷或镜像。清理前核对 data/logs/conf 均映射至宿主实例目录，容器可写层未发现需另存的业务文件；归档 stdout/stderr、精简容器元数据和最终账本，账本 SHA-256 与原目录一致。最早旧盘保留的 4 笔虚拟持仓与 41 笔平仓原样保存，没有伪造平仓。
 
 归档目录：`/home/neo/projects/hummingbot/hummingbot-api/bots/archived/container-cleanup-20261021T060920Z`。两个旧实例宿主目录、配置、数据库和原日志保留；新动态资金费实例、API、Postgres、Broker 保持运行，已停止的基差实例保留。清理后验收仍在运行，已读到 12 个健康样本、无持仓与平仓、净损益 0。
+
+
+## 前端恢复（2026-10-21 14:12 北京时间）
+
+用户反馈 `http://localhost:8501/` 无法访问。检查确认 Dashboard 原本使用 WSL 独立 Streamlit 进程，未运行在 Docker 中；环境停止后该进程退出，恢复部署时只启动了 API/数据库/Broker/模拟实例，遗漏了前端。8501 无监听，故仅检查 Docker 健康不能证明用户能访问完整系统。
+
+已通过原有 `hummingbot-dashboard/start` 和现有 `miniforge3/envs/dashboard` 环境恢复前端，未改应用源码、未新增容器或守护服务。后台认证值从已有 API 容器读入内存环境，不输出或另写凭据文件。日志：`/home/neo/projects/hummingbot/hummingbot-api/bots/data/dashboard-restore-20261021T061159Z.log`。
+
+WSL 页面及 `/_stcore/health` 均正常；Windows 使用绕过本地代理的直接 HTTP 请求访问 localhost 和 127.0.0.1 的 8501 首页，均返回 200。通过已有 Streamlit AppTest 实际执行首页与实例管理页面，两者无异常、无错误提示，后者可连接实际 API。测试工具退出有客户端清理告警，不作为线上进程异常。未进行图形浏览器截图验证。
+
+本次只恢复原有前端，不重启 API/模拟盘，不中断 13:57:34 开始的验收，不覆盖 Dashboard 未提交的基差改动。后续完整部署检查应同时覆盖前端进程、Windows localhost 页面、后台连通、实例状态与验收采样，而不是只看交易容器。
