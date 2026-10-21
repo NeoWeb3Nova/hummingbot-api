@@ -83,6 +83,17 @@ class TestBasisStatArbitrageConfig(unittest.TestCase):
         roe = net_profit / real_margin
         self.assertEqual(roe, Decimal("0.0050"))  # 0.5% ROE
 
+    def test_dual_notional_and_leg_amounts(self):
+        pos_size = Decimal("1500.0")
+        p1 = Decimal("10.0")
+        p2 = Decimal("10.05")
+        amt1 = pos_size / p1
+        amt2 = pos_size / p2
+        self.assertEqual(amt1, Decimal("150.0"))
+        self.assertAlmostEqual(float(amt2), 149.2537, places=4)
+        total_notional = pos_size * Decimal("2")
+        self.assertEqual(total_notional, Decimal("3000.0"))
+
 
 if __name__ == "__main__":
     unittest.main()
