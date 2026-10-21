@@ -23,8 +23,8 @@ jobs:
           persist-credentials: false
       - name: Record native runtime
         run: |
-          docker pull hummingbot/hummingbot:latest
-          docker image inspect hummingbot/hummingbot:latest --format '{{.Id}} {{json .RepoDigests}}'
+          docker pull hummingbot/hummingbot@sha256:b676cb7279ca147b76a510777abf515a0d2f1b17e45a70da4831bb03a587c8e1
+          docker image inspect hummingbot/hummingbot@sha256:b676cb7279ca147b76a510777abf515a0d2f1b17e45a70da4831bb03a587c8e1 --format '{{.Id}} {{json .RepoDigests}}'
       - name: Offline strategy and universe regressions
         run: |
           docker run --rm --network none --entrypoint python \
@@ -32,5 +32,5 @@ jobs:
             -v "$GITHUB_WORKSPACE/bots/scripts:/home/hummingbot/scripts:ro" \
             -v "$GITHUB_WORKSPACE/test/test_funding_arb_audit.py:/audit-tests/test_funding_arb_audit.py:ro" \
             -v "$GITHUB_WORKSPACE/test/test_funding_universe.py:/audit-tests/test_funding_universe.py:ro" \
-            hummingbot/hummingbot:latest \
+            hummingbot/hummingbot@sha256:b676cb7279ca147b76a510777abf515a0d2f1b17e45a70da4831bb03a587c8e1 \
             -m unittest discover -s /audit-tests -p 'test_funding_*.py' -v

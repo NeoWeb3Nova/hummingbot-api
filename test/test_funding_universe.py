@@ -52,6 +52,7 @@ class Connector:
 class Fixture:
     def __init__(self):
         self.calls,self.books,self.persisted=[],set(),[]
+        self.persisted_states=[]
         self.fail_add=None;self.fail_cleanup=False
         self.fail_persist=False;self.fail_cost=False
         cfg=NS(auto_rotation_enabled=True,auto_rotation_interval_minutes=.5,
@@ -101,6 +102,7 @@ class Fixture:
     def persist(self):
         if self.fail_persist:raise OSError('disk full')
         self.persisted.append(copy.deepcopy(self.s.config.tokens))
+        self.persisted_states.append(copy.deepcopy(dict(admitted_at=self.u.admitted_at,cooldowns=self.u.cooldowns)))
     def _spawn(self,coro):
         coro.close()
         self.calls.append(('scheduled',))
@@ -166,6 +168,16 @@ class UniverseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.u._retire_candidate(position('NIL','50')))
     def test_decimal_scoring_replaces_worse_idle_market(self):
         self.assertEqual(self.u._retire_candidate(position('NIL','80')),'BTC')
+    def test_lower_gross_rate_can_win_on_verified_net_return(self):
+        self.f.set_rate('BTC','80')
+        self.assertEqual(self.u._retire_candidate(position('NIL','50',net='2')),'BTC')
+    def test_confirmed_cost_failure_is_not_unknown_market_data(self):
+        self.f.set_rate('BTC','80');self.f.fail_cost=True
+        self.assertEqual(self.u._retire_candidate(position('NIL','50')),'BTC')
+    def test_missing_book_never_becomes_zero_yield(self):
+        self.f.set_rate('BTC','80')
+        with patch.object(self.u,'_forecast_position',side_effect=MarketUnavailable('missing order book')):
+            self.assertIsNone(self.u._retire_candidate(position('NIL','100')))
     def test_unknown_current_market_is_not_zero_score(self):
         self.f.metadata.pop((BN,'BTC-USDT'))
         self.assertIsNone(self.u._retire_candidate(position('NIL','80')))
@@ -193,6 +205,8 @@ class UniverseTests(unittest.IsolatedAsyncioTestCase):
         remove_index=self.f.calls.index(('remove',BN,'BTC-USDT'))
         self.assertLess(add_index,remove_index)
         self.assertEqual(self.f.persisted[-1],{'NIL'})
+        self.assertIn('NIL',self.f.persisted_states[-1]['admitted_at'])
+        self.assertIn('BTC',self.f.persisted_states[-1]['cooldowns'])
         self.assertEqual(self.f.s.rotation_event_history[0]['added_token'],'NIL')
     async def test_persist_failure_rolls_back_universe_history_and_mounts(self):
         self.f.fail_persist=True

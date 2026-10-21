@@ -248,7 +248,7 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
     )
     auto_rotation_min_apr_delta: float = Field(
         default=0.05, ge=0,
-        json_schema_extra={"prompt": lambda mi: "Minimum APR advantage over idle token to trigger rotation (e.g. 0.40 for 40%): ", "prompt_on_new": False}
+        json_schema_extra={"prompt": lambda mi: "Minimum annualized net capital return advantage for idle-token rotation (0.05 = 5 percentage points): ", "prompt_on_new": False}
     )
     auto_rotation_max_active_tokens: int = Field(
         default=12, ge=1, le=30,

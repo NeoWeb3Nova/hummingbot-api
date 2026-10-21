@@ -206,12 +206,14 @@ class FundingUniverse:
         try:
             added = await self.mount(token)
             self.s.config.tokens = set(self.s.config.tokens) | {token}
+            previous_admitted = dict(self.admitted_at)
+            self.admitted_at[token] = self.s.current_timestamp
             try:
                 self.a.persist()
             except Exception:
                 self.s.config.tokens.discard(token)
+                self.admitted_at = previous_admitted
                 raise
-            self.admitted_at[token] = self.s.current_timestamp
             self.s.stopped_funding_arbitrages.setdefault(token, [])
             return True
         except asyncio.CancelledError:
@@ -271,16 +273,28 @@ class FundingUniverse:
                 best = self.s.get_most_profitable_combination(info)
                 daily = dec(best[3]) if best else ZERO
                 apr = daily*365  # Decimal throughout; stored display is percent
-                old = self._forecast_position(token) if daily >= dec(self.s.config.min_funding_rate_profitability) else None
+                old = None
+                if daily >= dec(self.s.config.min_funding_rate_profitability):
+                    try:
+                        old = self._forecast_position(token)
+                    except MarketUnavailable as exc:
+                        # Confirmed economic rejection differs from unknown/missing market data.
+                        if str(exc) not in ('full round-trip payback exceeds limit',
+                                            'full round-trip friction exceeds limit',
+                                            'entry basis exceeds configured funding-strategy limit'):
+                            raise
                 old_score = entry_rank(old)[0] if old else ZERO
             except (MarketUnavailable, KeyError, ValueError):
                 continue
-            # Preserve the hysteresis rule, but never replace a better fee-net candidate.
-            new_apr = dec(candidate['expected_profitability'])*365
-            if new_apr <= apr or (old is not None and entry_rank(candidate) >= entry_rank(old)):
-                continue
-            if apr >= dec(self.s.config.auto_rotation_min_apr) and new_apr-apr < dec(self.s.config.auto_rotation_min_apr_delta):
-                continue
+            # A lower gross APR can be better after costs. Hysteresis therefore
+            # compares annualized 12h net capital return, not the raw rate spread.
+            if old is not None:
+                new_rank, old_rank = entry_rank(candidate), entry_rank(old)
+                if new_rank[:3] >= old_rank[:3]:
+                    continue
+                advantage = (-new_rank[0]+old_rank[0])*365*2
+                if advantage < dec(self.s.config.auto_rotation_min_apr_delta):
+                    continue
             choices.append((old_score, -float(apr), token))
         return max(choices)[2] if choices else None
 
@@ -343,9 +357,12 @@ class FundingUniverse:
                         reason='Book-validated funding universe admission; no order placed')
                     prior_events = list(self.s.rotation_event_history)
                     prior_admitted = dict(self.admitted_at)
+                    prior_cooldowns = dict(self.cooldowns)
                     prior_rotation = self.s.last_rotation_timestamp
                     self.s.rotation_event_history = [event]+prior_events[:24]
                     self.admitted_at[token] = now
+                    if retired:
+                        self.cooldowns[retired] = now+self.s.config.universe_failed_candidate_cooldown_seconds
                     self.s.last_rotation_timestamp = now
                     try:
                         self.a.persist()
@@ -353,12 +370,12 @@ class FundingUniverse:
                         self.s.config.tokens=before
                         self.s.rotation_event_history=prior_events
                         self.admitted_at=prior_admitted
+                        self.cooldowns=prior_cooldowns
                         self.s.last_rotation_timestamp=prior_rotation
                         raise
                     committed=True
                     self.s.stopped_funding_arbitrages.setdefault(token,[])
                     if retired:
-                        self.cooldowns[retired]=now+self.s.config.universe_failed_candidate_cooldown_seconds
                         self.signals.reset(retired)
                         await self._detach(retired,list(self.s.connectors))
                     changes += 1
