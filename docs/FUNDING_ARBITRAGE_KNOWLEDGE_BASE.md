@@ -722,3 +722,12 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
 ## 2026-10-21：Git提交整理与模型开发交接
 
 用户已明确授权远程推送，本轮资金费改动与运行记录整理至默认分支；此前“推送待授权”文字仅为历史状态。下一轮worktree起点、48/69项受测版本、运行中的验收，以及三处未提交基差改动的保留边界见 [开发交接](FUNDING_DEVELOPMENT_HANDOFF_2026-10-21.md)。
+
+
+## 2026-10-21 19:25：基差统计套利全链路工程闭环与测试套件沉淀 (v2.4.1)
+
+在用户授权下全面接手基差统计套利开发。已按规范建立独立分支 `feat/basis-stat-arb-20261021`：
+1. **策略内核与微观风控参数**：`v2_basis_stat_arb.py` 全面对齐防高频磨损参数（`min_holding_seconds: 60` 最低持仓冷静期、`exit_persistence_ticks: 2` 持续确认、`taker_fee_rate: 0.0005` 四腿手续费透明化、`settlement_blackout_seconds: 60` 结算避让）；
+2. **自动化回归套件**：建立 `test_basis_stat_arb.py`（API 端 6 项参数与规则测试，Dashboard 端 11 项全景测试），总计通过全量回归；
+3. **运行环境零干扰**：资金费率套利 24h 采样（PID 279）保持独立运行，未受任何重启或信号干扰。
+
