@@ -1,0 +1,36 @@
+name: Funding paper regression
+
+on:
+  push:
+    branches: ['fix/funding-universe-*']
+    paths:
+      - 'bots/scripts/funding_arb_*.py'
+      - 'bots/scripts/v2_funding_rate_arb.py'
+      - 'test/test_funding_*.py'
+      - '.github/workflows/funding-paper-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-paper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # official v4
+        with:
+          persist-credentials: false
+      - name: Record native runtime
+        run: |
+          docker pull hummingbot/hummingbot:latest
+          docker image inspect hummingbot/hummingbot:latest --format '{{.Id}} {{json .RepoDigests}}'
+      - name: Offline strategy and universe regressions
+        run: |
+          docker run --rm --network none --entrypoint python \
+            -e FUNDING_SOURCE_ROOT=/home/hummingbot \
+            -v "$GITHUB_WORKSPACE/bots/scripts:/home/hummingbot/scripts:ro" \
+            -v "$GITHUB_WORKSPACE/test/test_funding_arb_audit.py:/audit-tests/test_funding_arb_audit.py:ro" \
+            -v "$GITHUB_WORKSPACE/test/test_funding_universe.py:/audit-tests/test_funding_universe.py:ro" \
+            hummingbot/hummingbot:latest \
+            -m unittest discover -s /audit-tests -p 'test_funding_*.py' -v
