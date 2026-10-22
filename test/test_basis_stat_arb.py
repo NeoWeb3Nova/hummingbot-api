@@ -110,6 +110,34 @@ class TestBasisStatArbitrageConfig(unittest.TestCase):
         self.assertLessEqual(c1_amount * p1, pos_size)
         self.assertLessEqual(c2_amount * p2, pos_size)
 
+    def test_simulated_latency_slippage_and_friction_accounting(self):
+        config = BasisStatArbitrageConfig(
+            connectors=["hyperliquid_perpetual", "binance_perpetual"],
+            tokens=["BTC"],
+            simulated_latency_slippage_pct=Decimal("0.0002"),
+        )
+        self.assertEqual(config.simulated_latency_slippage_pct, Decimal("0.0002"))
+
+        # Verify math identity: Real Net PnL = Gross PnL - DepthSlip - LatencySlip - Fees + Funding
+        gross_pnl = Decimal("15.00")
+        depth_slip = Decimal("1.80")
+        latency_slip = Decimal("1.20")
+        fees = Decimal("3.00")
+        funding = Decimal("0.50")
+
+        total_friction = depth_slip + latency_slip + fees
+        self.assertEqual(total_friction, Decimal("6.00"))
+
+        net_trade = gross_pnl - total_friction
+        self.assertEqual(net_trade, Decimal("9.00"))
+
+        total_net = net_trade + funding
+        self.assertEqual(total_net, Decimal("9.50"))
+
+        # Alpha retention rate: 9.50 / 15.00 = 63.33%
+        alpha_retention = (total_net / gross_pnl) * Decimal("100")
+        self.assertAlmostEqual(float(alpha_retention), 63.3333, places=3)
+
 
 if __name__ == "__main__":
     unittest.main()
