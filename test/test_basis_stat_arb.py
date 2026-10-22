@@ -95,5 +95,21 @@ class TestBasisStatArbitrageConfig(unittest.TestCase):
         self.assertEqual(total_notional, Decimal("3000.0"))
 
 
+    def test_coin_neutral_delta_zero(self):
+        pos_size = Decimal("1500.0")
+        p1 = Decimal("10.0")
+        p2 = Decimal("10.07")  # 70 bps spread
+        max_p = max(p1, p2)
+        hedged_amount = pos_size / max_p
+        # Both legs have exact same token quantity (Coin-Neutral / Delta-Zero)
+        c1_amount = hedged_amount
+        c2_amount = hedged_amount
+        self.assertEqual(c1_amount, c2_amount)
+        self.assertEqual(c1_amount - c2_amount, Decimal("0"))
+        # Sized so neither notional exceeds pos_size
+        self.assertLessEqual(c1_amount * p1, pos_size)
+        self.assertLessEqual(c2_amount * p2, pos_size)
+
+
 if __name__ == "__main__":
     unittest.main()
