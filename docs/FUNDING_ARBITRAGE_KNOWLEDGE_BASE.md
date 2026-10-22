@@ -738,6 +738,45 @@ flowchart LR
      - 在 `test_basis_stat_arb.py` 中扩展 `test_dual_notional_and_margin_breakdown` 测试；
      - API 6 项测试、Dashboard 12 项基差套利测试及全量 60 项测试 100% 通过。
 
+### Case 35: Streamlit CommonMark 缩进代码块解析陷阱与原生 `st.html` 纯净渲染隔离 (CommonMark Indented Code Block Trap & Native `st.html` Isolation) (v2.4.4)
+- **现象定位与事故还原**：
+  - 用户截图反馈活跃基差持仓卡片异常，顶栏徽章与损益正常显示，但下方的“资金与仓位规格明细面板”及后续均值回归进度条直接在前端暴露了原始 HTML 代码，并带有黑色代码块背景与右上角复制按钮。
+- **底层根因剖析 (CommonMark 规范 Type 6 HTML Block 机制)**：
+  - Streamlit `st.markdown(..., unsafe_allow_html=True)` 依赖 CommonMark / Markdown 渲染规范；
+  - 开发者在 Python 循环中编写 `st.markdown(f"""...""")` 时，保留了 Python 函数内部的 16~24 字符行首缩进，并且在各 `<div>` 之间使用了空行（`\n\n`）来组织代码视觉层级；
+  - 根据 CommonMark 规范，一旦在 HTML 块内部遇到空行，Markdown 解析器将判定当前 HTML 块结束；紧接着下一行以 4 个或更多空格开头的文本（`                    <!-- 资金与仓位规格明细面板 -->`）会被强制解析为 **Indented Code Block（缩进代码块）**；
+  - 结果：前端直接将原生 HTML 文本作为代码块（`<pre><code>`）高亮渲染并提供复制按钮，严重破坏 UI 呈现。
+- **工业级防御方案与架构重构**：
+  1. **采用原生 `st.html` 绕过 Markdown 引擎**：
+     - Streamlit 原生提供 `st.html(html_str)`，专门用于直接向 DOM 注入 HTML 内容，完全不受 CommonMark 缩进或空行规则的干扰；
+     - 采用兼容性包装器：优先调用 `st.html()`，并在降级环境回退到去缩进去空行安全的 `st.markdown()`。
+  2. **消除模板字符串行首缩进与多余空行**：
+     - 重构 `basis_stat_arb_view.py` 与 `frontend/pages/config/basis_stat_arb/app.py` 中的 HTML 模板字符串，所有 HTML 标签顶格书写，去除段落间的孤立空行，彻底规避任何 Markdown 解析歧义。
+  3. **自动化测试守卫断言**：
+     - 在 `test/test_basis_stat_arb.py` 的 `TestBasisRendering` 中增设反代码泄露测试断言：
+       - 断言 `app.html` 成功捕获 HTML 元素；
+       - 断言 `app.markdown` 中坚决不得出现任何 `<!-- 资金与仓位规格明细面板 -->` 或未解析的 HTML 标签，确保此类视觉回归在 CI 阶段即可被 100% 拦截。
+
+### Case 36: 基差统计套利四大实盘防线整改：废除正收益平仓软锁、安全阈值扩容、Coin-Neutral数量对齐与影子微额压测体系 (v2.5.0)
+
+- **业务背景与量化审计触因**：
+  - 在对 211 笔模拟成交（99.05% 胜率，+$577.55 净利）的深度逆向工程中，识别出 4 大严重脱离实盘的逻辑漏洞：
+    1. 平仓软锁掩耳盗铃：`basis_tp_raw = is_basis_compressed and (total_net_pnl > 0)` 导致代码在模拟盘中“只报喜不报忧”，死扛至正数才出场；
+    2. 入场阈值过于脆弱：0.32% 门槛在扣除 20 bps 手续费与 15~20 bps 真实滑点后实际为负期望；
+    3. 金额配平导致 Delta 裸露：按 $1,500/P 配平使低价交易所多买入代币，残留净 Delta 敞口；
+    4. 缺乏实盘压测桥梁：直接投入大资金面临单腿报单失败风险。
+- **四大核心工程落地与数学重构**：
+  1. **废除“必须正收益才平仓”软锁**：
+     - 修改判定为 `basis_tp_raw = is_basis_compressed`，一旦基差收敛至目标线（$\le 0.05\%$）立即平仓退避，即使微亏也绝不死扛，还原真实数学胜率；平仓原因自适应标注为 `TP` 或 `Exit`；
+  2. **安全边际阈值扩容**：
+     - 将配置生成器默认入场阈值从 0.32% 全面提升至 `0.70% (70 bps)`（区间 0.60% ~ 0.80%），提供充足的滑点与跨所网络时差容忍度；
+  3. **代币数量严格对称（Coin-Neutral / Delta-Zero）**：
+     - 开仓以统一基准代币数量进行配平：$Q = \frac{\text{pos\_size}}{\max(P_1, P_2)}$，严格保证 $Q_1 = Q_2$；
+     - 使得市场大盘绝对价格涨跌 $\Delta P$ 在两腿盈亏累加时严格抵消，净损益严格锁定为基差利差压缩：$\text{Gross PnL} = Q \times (\text{Spread}_{entry} - \text{Spread}_{close})$；
+     - 手续费精准按四腿真实发生名义货值 $(\text{Open Notional} + \text{Close Notional}) \times \text{taker\_fee\_rate}$ 扣除；
+  4. **影子微额实盘压测模式集成**：
+     - 策略配置界面解除 $50 下限，支持低至 $\$10 \sim \$15$ 的单边货值，并增设快捷切换按钮，一键生成微额实盘配置，便于以极小真实资金压测真实撮合延迟与成交率。
+
 ---
 
 ## 四、核心财务与风控数学指标手册
@@ -892,6 +931,75 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
    - 在 `get_bot_basis_stat_arb_data` 与 `render_basis_stat_arb_tables` 函数顶层安全提取 `leverage = float(arb_data.get("leverage") or 3.0)` 并施加 `<=0` 防除零兜底；
    - 在 `v2_basis_stat_arb.py` 的 `_persist_state` 中同步补齐顶层 `"leverage": self.config.leverage` 字段持久化；
 3. **AppTest 端到端渲染测试注入**：在 `test_basis_stat_arb.py` 增设 `TestBasisRendering`，使用 `streamlit.testing.v1.AppTest` 完整模拟包含真实活跃持仓与历史平仓的 UI 渲染生命周期，全量 61 项测试 100% 通过。
+
+
+## 2026-10-22 08:00：基差活跃持仓 CommonMark 代码泄露修复与 `st.html` 纯净渲染隔离 (v2.4.4)
+
+排查并彻底解决用户反馈的活跃基差持仓卡片“代码直接暴露在黑色代码框内”的渲染 Bug：
+1. **定位 CommonMark 空行+4空格缩进代码块死穴**：`st.markdown` 内包含空行后跟随 20 空格缩进的 HTML 注释与标签，触发 CommonMark 缩进代码块规则，导致前端把原生 HTML 标签作为 `<pre><code>` 渲染并显示复制按钮；
+2. **迁移至 `st.html` 与模板顶格化**：全面改用 Streamlit 原生 `st.html`（附带安全回退），模板顶格并消除多余空行；
+3. **AppTest 守护断言**：在 `test_basis_stat_arb.py` 中增加断言拦截代码泄露，全量 61 项回归 100% 通过。
+
+
+## 2026-10-22 08:15：基差统计套利 211 笔战绩深度审计与真实性复盘报告
+
+详见专项审计报告：[`docs/BASIS_STAT_ARB_AUDIT_2026-10-22.md`](file:///home/neo/projects/hummingbot/docs/BASIS_STAT_ARB_AUDIT_2026-10-22.md)。
+对 211 笔模拟战绩进行全面数学复算与微观推演，深度揭示 99.05% 胜率背后的 5 大模拟盘假象：
+1. **代码级存活者偏差**：`basis_tp_raw` 强行绑定 `total_net_pnl > 0`，不赚钱死扛不平仓；
+2. **WebSocket 本地时差幽灵基差**：Binance 与 Hyperliquid 推送时差构成的客户端虚假价差；
+3. **零延迟原子化假设与单腿踏空**：实盘不可逾越的网络延迟与撤挂单竞争；
+4. **真实滑点摩擦击穿**：未计入盘口冲击成本；
+5. **Dollar-Neutral 残留未对冲 Delta 裸露**。
+明确提出实盘前严禁直接大额介入，必须执行微额影子压测与平仓逻辑纯粹化。
+
+
+## 2026-10-22 09:30：基差统计套利四大实盘防线整改落地 (v2.5.0)
+
+响应全面整改要求，完成代码层与配置层四大防线闭环重构：
+1. **废黜正收益掩耳盗铃机制**：`v2_basis_stat_arb.py` 删除 `and (total_net_pnl > 0)`，纯粹以数学基差收敛为退出信号，平仓原因自适应区分为 `TP` 或 `Exit`；
+2. **入场阈值扩容**：`min_entry_basis_pct` 由 0.32% 全面提升至 `0.70% (70 bps)`，容纳滑点与时延；
+3. **Coin-Neutral 严格等币数对齐**：按 $Q = \text{pos\_size} / \max(P_1, P_2)$ 统一两腿代币数量（$Q_1 \equiv Q_2$），多空完全抵消标的贝塔价格变动，Delta 净敞口降为 0；
+4. **影子微额压测体系**：配置生成器支持低至 $10~$15 微额输入与一键预设，配套生成 `basis_stat_arb_hyperliquid_binance_micro_live.yml`，全量 63 项前端与核心回归测试 100% 通过。
+
+
+## 2026-10-22 10:00：基差统计套利 216 笔历史战绩追溯回测与账本校对回填
+
+详见专项回测报告：[`docs/BASIS_STAT_ARB_BACKTEST_2026-10-22.md`](file:///home/neo/projects/hummingbot/docs/BASIS_STAT_ARB_BACKTEST_2026-10-22.md)。
+对实例累计的 216 笔历史平仓数据按 v2.5.0 最新策略进行全面追溯重测与账本校正：
+1. **Delta-Zero 账本校对**：将历史记录由按金额计算代币数重算为统一币数（$Q_1 \equiv Q_2$），多空 Delta 裸露归零；以四腿真实名义货值精准计提手续费，更新实例持久化账本 `basis_stat_arb_trades.json`（原始数据备份在 `*.backup_20261022_raw`）；
+2. **70 bps 门槛质量分层**：
+   - 跨过 70 bps 新门槛的优质交易共 10 笔（占比 4.63%），贡献 +$69.42 净利，单笔平均 +$6.94（达杂波交易的近 3 倍），胜率 100%；
+   - 处于 32~69 bps 杂波交易 206 笔（95.37%），单笔均利仅 +$2.53，极易被实盘冲击滑点抹杀；
+3. **真实滑点压力测试定位致死点**：
+   - 单腿滑点 $\le 2$ bps 时，策略净利保持 +$331.27（胜率 97.2%）；
+   - 单腿滑点达 4 bps 时，胜率腰斩至 48.15%（净利跌至 +$72.07）；
+   - 单腿滑点达 5 bps 时，策略全面转负亏损 -$57.53；
+   - 测算出旧策略（0.32% 门槛）致死点为 4.5 bps/腿，而新策略（0.70% 门槛）提供高达 12.5 bps/腿的充裕安全垫。
+
+
+## 2026-10-22 11:30：活跃基差持仓时间归零与冷静期锁定失真全链路排查修复 (v2.6.1)
+
+排查并彻底解决用户反馈的活跃基差持仓卡片“持仓时间显示 0 秒、冷却锁定恒定为 0s/60s、结算周期显示 0 周期”等严重失真问题：
+1. **根因定位（数据链路断层与只读不写）**：
+   - **后端策略状态只读不写**：`v2_basis_stat_arb.py` 的 `manage_active_positions` 虽在内存中实时计算了 `duration_s`、最新盘口报价与浮动盈亏，但从未原地写回 `self.active_basis_arbitrages[token]`。导致持久化到 `basis_stat_arb_trades.json` 的 `active_positions` 仅保留了入场时的静态快照，缺少 `duration_seconds`、`current_price_1/2`、`current_basis_pct`、`settlement_count` 等动态指标。
+   - **前端取值脆弱与逻辑死锁**：前端组件 `basis_stat_arb_view.py` 读取 `dur_sec = int(p.get("duration_seconds", 0))`，在键缺失时回退为 0。导致 `if dur_sec < min_hold`（0 < 60）恒为真，页面永远错误显示 `🛡️ 冷却锁定中 (0s / 门槛 60s)` 与 `持仓: 0秒`。
+   - **结算周期与当前基差虚假**：SAGA 仓位已累计 5 笔资金费（4 次 HL，1 次 BN，去重 4 个独立整点窗口，累计入账 +$0.525），但因缺少 `settlement_count` 键前端默认显示 0 周期；当前基差因缺少当前价被误算为 100% 收敛。
+2. **前后端双向动态自愈方案**：
+   - **前端时间戳动态解耦**：改用 `max(0, int(now_ts - open_timestamp))` 实时动态计算持续时间，配合 `format_precise_duration` 渲染出人类友好的精确时间（如 `3小时 36分 33秒`），并显式展示开仓绝对时间点；彻底杜绝轮询延迟造成的“0秒”假象。
+   - **冷静期徽章自适应分流**：真实持仓超过 60 秒时，自适应呈现 `🟢 止盈就绪 (已过冷静期 60s)`；不足 60 秒时呈现动态倒计时 `🛡️ 最短持仓冷静中 (已持仓 Xs / 剩余 Ys 解锁)`。
+   - **盘口报价与浮盈穿透兜底**：前端自动从 `market_comparison` 实时行情字典中挂载最新报价并重算双腿未实现浮盈、净浮盈与双边真实保证金 ROE。
+   - **结算周期动态去重**：自动按 `funding_payments` 时间戳做 `set` 去重统计实际结算窗口（SAGA 精准显示 4 周期）。
+   - **后端策略全状态持久化**：在 `manage_active_positions` 中将 `current_price_1/2`, `current_basis_pct`, `duration_seconds`, `gross_unrealized_trading_pnl`, `net_unrealized_trading_pnl`, `total_pos_net`, `settlement_count` 等原地写回字典，保证磁盘与内存 100% 同步。
+3. **活跃仓位实况核准**：
+   - **SAGA**：开仓于 11:27（已持仓 3小时 36分），累计结算 4 个整点周期（+$0.525），基差已从 +0.40% 压缩至 +0.20%，处于健康的持仓收敛期。
+   - **STRK**：开仓于 14:49（已持仓 14分），基差已从 +0.38% 极限收敛至 +0.018%（收敛进度 81.6%），远超 60 秒冷静期，已处于 `🟢 止盈就绪` 状态。
+4. **自动化测试与质量保障**：
+   - 在 `hummingbot-dashboard/test/test_basis_stat_arb.py` 中新增 `test_active_position_dynamic_duration_and_lock_badge` 测试；
+   - 全量回归测试 100% 通过（前端 17/17 项，API 9/9 项）。
+
+
+
+
 
 
 
