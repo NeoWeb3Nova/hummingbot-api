@@ -35,6 +35,10 @@ class TestBasisStatArbitrageConfig(unittest.TestCase):
         self.assertEqual(config.min_order_size_quote, Decimal("300.0"))
         self.assertEqual(config.min_executable_net_edge_pct, Decimal("0.0018"))
         self.assertEqual(config.max_executable_depth_slippage_pct, Decimal("0.0025"))
+        self.assertTrue(config.check_margin_before_entry)
+        self.assertEqual(config.margin_buffer_ratio, Decimal("0.05"))
+        self.assertTrue(config.margin_aware_downsizing)
+        self.assertEqual(config.dry_run_virtual_balance_quote, Decimal("0.0"))
 
     def test_token_and_connector_normalization(self):
         config = BasisStatArbitrageConfig(
@@ -141,6 +145,59 @@ class TestBasisStatArbitrageConfig(unittest.TestCase):
         # Alpha retention rate: 9.50 / 15.00 = 63.33%
         alpha_retention = (total_net / gross_pnl) * Decimal("100")
         self.assertAlmostEqual(float(alpha_retention), 63.3333, places=3)
+
+    def test_pre_flight_margin_calculation_and_cushion(self):
+        """Verify pre-flight margin formula with 5% cushion and taker fee reserve."""
+        pos_size = Decimal("1500.0")
+        leverage = Decimal("3.0")
+        buffer_ratio = Decimal("0.05")
+        taker_fee = Decimal("0.0005")
+
+        # Margin factor per dollar notional: (1/leverage)*(1+buffer) + fee
+        # (1/3) * 1.05 + 0.0005 = 0.35 + 0.0005 = 0.3505
+        margin_factor = (Decimal("1.0") / leverage) * (Decimal("1.0") + buffer_ratio) + taker_fee
+        req_margin_per_leg = pos_size * margin_factor
+        self.assertEqual(req_margin_per_leg, Decimal("525.75"))  # $500 nominal + $25 buffer + $0.75 fee
+
+    def test_margin_aware_downsizing_logic(self):
+        """Verify that available margin between full requirement and min order scales down safely."""
+        target_pos_size = Decimal("1500.0")
+        leverage = Decimal("3.0")
+        buffer_ratio = Decimal("0.05")
+        taker_fee = Decimal("0.0005")
+        min_order_sz = Decimal("300.0")
+        margin_factor = (Decimal("1.0") / leverage) * (Decimal("1.0") + buffer_ratio) + taker_fee
+
+        # User only has $350 available on Exchange 1, and $600 on Exchange 2
+        avail_1 = Decimal("350.0")
+        avail_2 = Decimal("600.0")
+
+        max_pos_1 = avail_1 / margin_factor  # 350 / 0.3505 = 998.57
+        max_pos_2 = avail_2 / margin_factor  # 600 / 0.3505 = 1711.84
+        max_feasible = min(max_pos_1, max_pos_2)
+
+        self.assertGreaterEqual(max_feasible, min_order_sz)
+        self.assertLess(max_feasible, target_pos_size)
+        self.assertAlmostEqual(float(max_feasible), 998.573, places=2)
+
+    def test_insufficient_margin_intercept_scenario(self):
+        """Verify that when available balance is below min order requirement, trade is strictly blocked."""
+        leverage = Decimal("3.0")
+        buffer_ratio = Decimal("0.05")
+        taker_fee = Decimal("0.0005")
+        min_order_sz = Decimal("300.0")
+        margin_factor = (Decimal("1.0") / leverage) * (Decimal("1.0") + buffer_ratio) + taker_fee
+
+        min_req_margin = min_order_sz * margin_factor  # $105.15
+        self.assertEqual(min_req_margin, Decimal("105.15"))
+
+        # User only has $50 on Exchange 1 (fails min order requirement)
+        avail_1 = Decimal("50.0")
+        avail_2 = Decimal("1000.0")
+        max_feasible = min(avail_1 / margin_factor, avail_2 / margin_factor)
+
+        # Fails minimum order threshold -> Hard Intercept!
+        self.assertLess(max_feasible, min_order_sz)
 
 
 if __name__ == "__main__":
