@@ -27,13 +27,13 @@ class TestBasisStatArbitrageConfig(unittest.TestCase):
         self.assertEqual(config.exit_persistence_ticks, 2)
         self.assertEqual(config.taker_fee_rate, Decimal("0.0005"))
         self.assertEqual(config.settlement_blackout_seconds, 60)
-        self.assertEqual(config.min_entry_basis_pct, Decimal("0.0070"))
+        self.assertEqual(config.min_entry_basis_pct, Decimal("0.0050"))
         self.assertEqual(config.take_profit_basis_compression_pct, Decimal("0.0015"))
         self.assertEqual(config.entry_persistence_ticks, 2)
         self.assertEqual(config.stop_loss_confirmation_ticks, 5)
         self.assertTrue(config.dynamic_capacity_sizing)
         self.assertEqual(config.min_order_size_quote, Decimal("300.0"))
-        self.assertEqual(config.min_executable_net_edge_pct, Decimal("0.0030"))
+        self.assertEqual(config.min_executable_net_edge_pct, Decimal("0.0018"))
         self.assertEqual(config.max_executable_depth_slippage_pct, Decimal("0.0025"))
 
     def test_token_and_connector_normalization(self):
