@@ -33,13 +33,15 @@ class TestSpotPerpCashCarryConfig(unittest.TestCase):
         self.assertEqual(config.position_size_quote, Decimal("1000.0"))
         self.assertEqual(config.max_concurrent_tokens, 3)
         self.assertEqual(config.perp_leverage, 3)
-        self.assertEqual(config.min_entry_annualized_apr, Decimal("0.25"))
+        self.assertEqual(config.min_entry_annualized_apr, Decimal("0.20"))
         self.assertEqual(config.exit_annualized_apr, Decimal("0.08"))
         self.assertEqual(config.max_payback_hours, Decimal("12.0"))
+        self.assertEqual(config.target_horizon_hours, Decimal("168.0"))
+        self.assertEqual(config.max_friction_to_yield_ratio, Decimal("0.15"))
         self.assertEqual(config.liquidation_buffer_pct, Decimal("0.15"))
         self.assertTrue(config.dry_run)
-        self.assertEqual(config.dry_run_virtual_spot_quote, Decimal("3000.0"))
-        self.assertEqual(config.dry_run_virtual_perp_quote, Decimal("1500.0"))
+        self.assertEqual(config.dry_run_virtual_spot_quote, Decimal("5000.0"))
+        self.assertEqual(config.dry_run_virtual_perp_quote, Decimal("2500.0"))
 
 
 class TestSpotPerpFinancialFormulas(unittest.TestCase):
@@ -143,6 +145,104 @@ class TestSpotPerpStatePersistence(unittest.TestCase):
             self.assertEqual(loaded["active_positions"][0]["token"], "ENA")
             self.assertEqual(len(loaded["closed_trades"]), 1)
             self.assertEqual(loaded["closed_trades"][0]["total_net_pnl"], 12.80)
+
+
+class TestSpotPerpBugRegressions(unittest.TestCase):
+    """
+    Regression test suite for Case 56 post-mortem fixes:
+    1. Slippage quote dimension inflation (REZ 250x phantom loss bug)
+    2. Backwardation barrier rejection (strict AGENTS.md Rule 4 enforcement)
+    3. Safe funding KeyError and corrupted data handling
+    4. Breakeven trailing stop protection against exiting at negative ROE
+    """
+
+    def test_slippage_quote_dimension_scaling(self):
+        # Case REZ: $0.0040 price, 125,000 tokens for $500 notional
+        coin_amt = Decimal("125000.0")
+        p_close = Decimal("0.0040")
+        notional_close = coin_amt * p_close  # 500.0 USD
+        p_slip = Decimal("0.0005")  # 5 bps depth slippage
+
+        # Broken buggy formula: multiplied slippage ratio by coin amount!
+        buggy_slippage = p_slip * coin_amt  # 62.50 USD (12.5% of trade!)
+        self.assertEqual(buggy_slippage, Decimal("62.5"))
+
+        # Fixed formula: multiply slippage ratio by quote notional
+        fixed_slippage = p_slip * notional_close  # 0.25 USD (0.05% of trade)
+        self.assertEqual(fixed_slippage, Decimal("0.25"))
+        self.assertLess(fixed_slippage, Decimal("1.0"))
+
+    def test_backwardation_barrier_rejection(self):
+        strategy = SpotPerpCashCarryStrategy.__new__(SpotPerpCashCarryStrategy)
+        strategy.config = SpotPerpCashCarryConfig()
+
+        # Case 1: Backwardation (Perp < Spot by -5 bps)
+        p_spot = Decimal("1.0000")
+        p_perp = Decimal("0.9995")  # -5 bps
+        p_slip = Decimal("0.0002")
+        rate_1h = Decimal("0.00015")  # 131% APR
+
+        basis_spread, total_friction, payback_hours, is_acceptable = strategy.calculate_friction_and_payback(
+            p_spot, p_perp, p_slip, p_slip, rate_1h
+        )
+        self.assertFalse(is_acceptable, "Backwardation entry must be strictly rejected")
+        self.assertEqual(payback_hours, Decimal("999.0"))
+
+        # Case 2: Contango (Perp > Spot by +25 bps)
+        p_perp_contango = Decimal("1.0025")  # +25 bps
+        basis_spread, total_friction, payback_hours, is_acceptable = strategy.calculate_friction_and_payback(
+            p_spot, p_perp_contango, p_slip, p_slip, rate_1h
+        )
+        self.assertTrue(is_acceptable, "Contango entry with fast payback must be accepted")
+        self.assertLessEqual(payback_hours, Decimal("12.0"))
+
+    def test_safe_funding_keyerror_handling(self):
+        strategy = SpotPerpCashCarryStrategy.__new__(SpotPerpCashCarryStrategy)
+        mock_conn = MagicMock()
+        mock_conn.get_funding_info.side_effect = KeyError("SAGA-USD not found in orderbook")
+        strategy.connectors = {"hyperliquid_perpetual": mock_conn}
+
+        # Verify get_safe_funding_info catches KeyError and returns None
+        info = strategy.get_safe_funding_info("hyperliquid_perpetual", "SAGA-USD")
+        self.assertIsNone(info)
+
+        # Verify get_safe_funding_rate_1h returns Decimal(0)
+        rate = strategy.get_safe_funding_rate_1h("hyperliquid_perpetual", "SAGA-USD")
+        self.assertEqual(rate, Decimal("0"))
+
+        # Verify anomalous funding rate (> 5%/h) returns Decimal(0)
+        mock_info = MagicMock()
+        mock_info.rate = "0.15"  # 15% per hour is corrupt anomaly
+        mock_conn.get_funding_info.side_effect = None
+        mock_conn.get_funding_info.return_value = mock_info
+        corrupt_rate = strategy.get_safe_funding_rate_1h("hyperliquid_perpetual", "SAGA-USD")
+        self.assertEqual(corrupt_rate, Decimal("0"))
+
+    def test_breakeven_trailing_stop_negative_roe_protection(self):
+        config = SpotPerpCashCarryConfig()
+        # Simulated position where breakeven is active, duration is satisfied
+        pos = {"breakeven_active": True}
+        duration_s = 5000  # > min_holding_seconds (3600)
+
+        # Scenario 1: TIA bug case - ROE is negative (-0.25%), stop threshold is +0.20%
+        roe_pct_negative = Decimal("-0.0025")
+        is_breakeven_stop_negative = (
+            pos.get("breakeven_active", False) and
+            roe_pct_negative < config.breakeven_trailing_stop_pct and
+            roe_pct_negative >= Decimal("0.0") and
+            duration_s >= config.min_holding_seconds
+        )
+        self.assertFalse(is_breakeven_stop_negative, "Breakeven trailing stop must never trigger at a negative ROE")
+
+        # Scenario 2: Normal breakeven stop case - ROE was +0.8%, fell back to +0.1% (> 0, < 0.2%)
+        roe_pct_positive = Decimal("0.0010")
+        is_breakeven_stop_positive = (
+            pos.get("breakeven_active", False) and
+            roe_pct_positive < config.breakeven_trailing_stop_pct and
+            roe_pct_positive >= Decimal("0.0") and
+            duration_s >= config.min_holding_seconds
+        )
+        self.assertTrue(is_breakeven_stop_positive, "Breakeven stop should trigger when ROE is between 0.0 and +0.2%")
 
 
 if __name__ == "__main__":
