@@ -200,5 +200,263 @@ class TestBasisStatArbitrageConfig(unittest.TestCase):
         self.assertLess(max_feasible, min_order_sz)
 
 
+class TestLiveTradingSingleLegGuardAndQuantization(unittest.TestCase):
+    """
+    Test Case 58: Live Trading Single-Leg Execution & Rollback Guardian and Quantization.
+    """
+
+    def setUp(self):
+        self.config = BasisStatArbitrageConfig(
+            connectors=["hyperliquid_perpetual", "binance_perpetual"],
+            tokens=["SOL", "ETH"],
+            single_leg_timeout_seconds=5.0,
+            dry_run=False,
+            position_size_quote=Decimal("15.0"),
+            min_order_size_quote=Decimal("10.0"),
+            leverage=3,
+        )
+
+    def test_single_leg_timeout_config(self):
+        self.assertEqual(self.config.single_leg_timeout_seconds, 5.0)
+        # Validation bounds
+        with self.assertRaises(ValidationError):
+            BasisStatArbitrageConfig(
+                connectors=["hyperliquid_perpetual", "binance_perpetual"],
+                tokens=["SOL"],
+                single_leg_timeout_seconds=0.5,  # Below ge=1.0
+            )
+
+    def test_quantize_order_amount_logic(self):
+        """Test exchange rule compliance for step sizes and min notional thresholds."""
+        from unittest.mock import MagicMock
+
+        # Create dummy strategy instance
+        strat = BasisStatArbitrage.__new__(BasisStatArbitrage)
+        strat.config = self.config
+        strat._logger = MagicMock()
+
+        # Mock connectors
+        conn1 = MagicMock()
+        conn2 = MagicMock()
+        conn1.quantize_order_amount = lambda tp, amt: Decimal(str(round(float(amt), 2)))
+        conn2.quantize_order_amount = lambda tp, amt: Decimal(str(round(float(amt), 2)))
+
+        rule1 = MagicMock(min_order_size=Decimal("0.01"), min_notional_size=Decimal("10.0"))
+        rule2 = MagicMock(min_order_size=Decimal("0.01"), min_notional_size=Decimal("5.0"))
+        conn1.trading_rules = {"SOL-USD": rule1}
+        conn2.trading_rules = {"SOL-USDT": rule2}
+
+        strat.connectors = {"hyperliquid_perpetual": conn1, "binance_perpetual": conn2}
+
+        # Case A: Valid sizing (0.1 SOL @ $150 = $15 notional > $10)
+        res = strat.quantize_order_amount("SOL", Decimal("0.103"), Decimal("150.0"), Decimal("150.0"))
+        self.assertEqual(res, Decimal("0.10"))
+
+        # Case B: Below Hyperliquid floor ($10.0) -> (0.05 SOL @ $150 = $7.50 < $10)
+        res_small = strat.quantize_order_amount("SOL", Decimal("0.05"), Decimal("150.0"), Decimal("150.0"))
+        self.assertIsNone(res_small)
+
+        # Case C: Below min_order_size
+        rule1.min_order_size = Decimal("1.0")
+        res_below_min = strat.quantize_order_amount("SOL", Decimal("0.5"), Decimal("150.0"), Decimal("150.0"))
+        self.assertIsNone(res_below_min)
+
+    def test_single_leg_guard_both_filled_scenario(self):
+        """When both legs fill within timeout, transition execution_status to ACTIVE_HEDGED."""
+        from unittest.mock import MagicMock
+
+        strat = BasisStatArbitrage.__new__(BasisStatArbitrage)
+        strat.config = self.config
+        strat._logger = MagicMock()
+        strat._set_current_timestamp(1000.0)
+        strat.quarantine_tokens = {}
+        strat.stopped_basis_arbitrages = {}
+        strat._persist_state = MagicMock()
+
+        # Mock active position
+        pos = {
+            "token": "SOL",
+            "is_virtual": False,
+            "execution_status": "PENDING_EXECUTION",
+            "open_timestamp": 998.0,  # 2.0s elapsed
+            "executors_ids": ["exec_1", "exec_2"],
+            "connector_1": "hyperliquid_perpetual",
+            "connector_2": "binance_perpetual",
+            "entry_price_1": 150.0,
+            "entry_price_2": 150.5,
+            "amount_1": 0.1,
+            "amount_2": 0.1,
+            "position_size": 15.0,
+            "leverage": 3,
+            "total_margin": 10.0,
+        }
+        strat.active_basis_arbitrages = {"SOL": pos}
+
+        # Mock executors: both filled
+        ex1 = MagicMock(open_filled_amount=Decimal("0.1"), entry_price=Decimal("150.1"), is_closed=False)
+        ex2 = MagicMock(open_filled_amount=Decimal("0.1"), entry_price=Decimal("150.4"), is_closed=False)
+        strat.get_executor_by_id = lambda eid: ex1 if eid == "exec_1" else ex2
+
+        actions = strat._evaluate_single_leg_execution_guard()
+        self.assertEqual(len(actions), 0)
+        self.assertEqual(pos["execution_status"], "ACTIVE_HEDGED")
+        self.assertEqual(pos["entry_price_1"], 150.1)
+        self.assertEqual(pos["entry_price_2"], 150.4)
+
+    def test_single_leg_guard_emergency_unwind_leg1_scenario(self):
+        """When Leg 1 fills and Leg 2 is 0-fill past timeout, trigger emergency unwind."""
+        from unittest.mock import MagicMock
+
+        strat = BasisStatArbitrage.__new__(BasisStatArbitrage)
+        strat.config = self.config
+        strat._logger = MagicMock()
+        strat._set_current_timestamp(1006.0)  # 6.0s elapsed (> 5s timeout)
+        strat.quarantine_tokens = {}
+        strat.stopped_basis_arbitrages = {}
+        strat._persist_state = MagicMock()
+
+        pos = {
+            "token": "SOL",
+            "is_virtual": False,
+            "execution_status": "PENDING_EXECUTION",
+            "open_timestamp": 1000.0,
+            "executors_ids": ["exec_1", "exec_2"],
+            "connector_1": "hyperliquid_perpetual",
+            "connector_2": "binance_perpetual",
+            "side_1": "BUY",
+            "side_2": "SELL",
+            "entry_price_1": 150.0,
+            "entry_price_2": 150.5,
+            "amount_1": 0.1,
+            "amount_2": 0.1,
+            "position_size": 15.0,
+            "leverage": 3,
+            "total_margin": 10.0,
+            "entry_basis_pct": 0.005,
+        }
+        strat.active_basis_arbitrages = {"SOL": pos}
+
+        # Leg 1 filled, Leg 2 0-fill
+        ex1 = MagicMock(
+            open_filled_amount=Decimal("0.1"),
+            open_filled_amount_quote=Decimal("15.0"),
+            cum_fees_quote=Decimal("0.01"),
+            net_pnl_quote=Decimal("-0.02"),
+            close_price=Decimal("149.8"),
+            is_closed=False,
+        )
+        ex2 = MagicMock(
+            open_filled_amount=Decimal("0.0"),
+            is_closed=True,
+        )
+        strat.get_executor_by_id = lambda eid: ex1 if eid == "exec_1" else ex2
+
+        actions = strat._evaluate_single_leg_execution_guard()
+
+        # Must return StopExecutorAction for both legs (unwinding Leg 1)
+        self.assertEqual(len(actions), 2)
+        exec_ids_stopped = [a.executor_id for a in actions]
+        self.assertIn("exec_1", exec_ids_stopped)
+        self.assertIn("exec_2", exec_ids_stopped)
+
+        # Removed from active positions
+        self.assertNotIn("SOL", strat.active_basis_arbitrages)
+
+        # Archived into stopped trades
+        self.assertIn("SOL", strat.stopped_basis_arbitrages)
+        record = strat.stopped_basis_arbitrages["SOL"][0]
+        self.assertEqual(record["close_reason"], "SINGLE_LEG_EMERGENCY_UNWIND_LEG1_FILLED")
+
+        # Quarantined for 30 minutes (1800s)
+        self.assertIn("SOL", strat.quarantine_tokens)
+        self.assertEqual(strat.quarantine_tokens["SOL"], 1006.0 + 1800.0)
+
+    def test_single_leg_guard_emergency_unwind_leg2_scenario(self):
+        """When Leg 2 fills and Leg 1 is 0-fill past timeout, trigger emergency unwind for Leg 2."""
+        from unittest.mock import MagicMock
+
+        strat = BasisStatArbitrage.__new__(BasisStatArbitrage)
+        strat.config = self.config
+        strat._logger = MagicMock()
+        strat._set_current_timestamp(1006.0)
+        strat.quarantine_tokens = {}
+        strat.stopped_basis_arbitrages = {}
+        strat._persist_state = MagicMock()
+
+        pos = {
+            "token": "AVAX",
+            "is_virtual": False,
+            "execution_status": "PENDING_EXECUTION",
+            "open_timestamp": 1000.0,
+            "executors_ids": ["exec_1", "exec_2"],
+            "connector_1": "hyperliquid_perpetual",
+            "connector_2": "binance_perpetual",
+            "side_1": "BUY",
+            "side_2": "SELL",
+            "entry_price_1": 25.0,
+            "entry_price_2": 25.1,
+            "amount_1": 0.6,
+            "amount_2": 0.6,
+            "position_size": 15.0,
+            "leverage": 3,
+            "total_margin": 10.0,
+            "entry_basis_pct": 0.004,
+        }
+        strat.active_basis_arbitrages = {"AVAX": pos}
+
+        # Leg 1 0-fill, Leg 2 filled
+        ex1 = MagicMock(open_filled_amount=Decimal("0.0"), is_closed=True)
+        ex2 = MagicMock(
+            open_filled_amount=Decimal("0.6"),
+            open_filled_amount_quote=Decimal("15.06"),
+            cum_fees_quote=Decimal("0.01"),
+            net_pnl_quote=Decimal("-0.01"),
+            close_price=Decimal("25.12"),
+            is_closed=False,
+        )
+        strat.get_executor_by_id = lambda eid: ex1 if eid == "exec_1" else ex2
+
+        actions = strat._evaluate_single_leg_execution_guard()
+
+        self.assertEqual(len(actions), 2)
+        self.assertNotIn("AVAX", strat.active_basis_arbitrages)
+        self.assertIn("AVAX", strat.stopped_basis_arbitrages)
+        record = strat.stopped_basis_arbitrages["AVAX"][0]
+        self.assertEqual(record["close_reason"], "SINGLE_LEG_EMERGENCY_UNWIND_LEG2_FILLED")
+        self.assertEqual(strat.quarantine_tokens["AVAX"], 1006.0 + 1800.0)
+
+    def test_single_leg_guard_zero_fill_abort_scenario(self):
+        """When neither leg fills within timeout, cleanly abort with zero loss."""
+        from unittest.mock import MagicMock
+
+        strat = BasisStatArbitrage.__new__(BasisStatArbitrage)
+        strat.config = self.config
+        strat._logger = MagicMock()
+        strat._set_current_timestamp(1006.0)
+        strat.quarantine_tokens = {}
+        strat.stopped_basis_arbitrages = {}
+        strat._persist_state = MagicMock()
+
+        pos = {
+            "token": "ETH",
+            "is_virtual": False,
+            "execution_status": "PENDING_EXECUTION",
+            "open_timestamp": 1000.0,
+            "executors_ids": ["exec_1", "exec_2"],
+        }
+        strat.active_basis_arbitrages = {"ETH": pos}
+
+        ex1 = MagicMock(open_filled_amount=Decimal("0.0"), is_closed=False)
+        ex2 = MagicMock(open_filled_amount=Decimal("0.0"), is_closed=False)
+        strat.get_executor_by_id = lambda eid: ex1 if eid == "exec_1" else ex2
+
+        actions = strat._evaluate_single_leg_execution_guard()
+
+        self.assertEqual(len(actions), 2)
+        self.assertNotIn("ETH", strat.active_basis_arbitrages)
+        self.assertIn("ETH", strat.quarantine_tokens)
+        self.assertEqual(strat.quarantine_tokens["ETH"], 1006.0 + 300.0)  # 5 min cooldown
+
+
 if __name__ == "__main__":
     unittest.main()
