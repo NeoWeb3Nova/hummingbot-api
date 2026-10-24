@@ -35,6 +35,8 @@ class TestSpotPerpCashCarryConfig(unittest.TestCase):
         self.assertEqual(config.perp_leverage, 3)
         self.assertEqual(config.min_entry_annualized_apr, Decimal("0.20"))
         self.assertEqual(config.exit_annualized_apr, Decimal("0.08"))
+        self.assertEqual(config.inversion_exit_apr, Decimal("-0.05"))
+        self.assertEqual(config.single_loss_quarantine_roe_pct, Decimal("0.020"))
         self.assertEqual(config.max_payback_hours, Decimal("12.0"))
         self.assertEqual(config.target_horizon_hours, Decimal("168.0"))
         self.assertEqual(config.max_friction_to_yield_ratio, Decimal("0.15"))
@@ -243,6 +245,105 @@ class TestSpotPerpBugRegressions(unittest.TestCase):
             duration_s >= config.min_holding_seconds
         )
         self.assertTrue(is_breakeven_stop_positive, "Breakeven stop should trigger when ROE is between 0.0 and +0.2%")
+
+
+    def test_inversion_exit_neutral_vs_adverse(self):
+        config = SpotPerpCashCarryConfig()
+        strategy = SpotPerpCashCarryStrategy.__new__(SpotPerpCashCarryStrategy)
+        strategy.config = config
+
+        # Scenario 1: Neutral rate (APR = 0.0%) - MUST NOT trigger inversion stop
+        curr_apr_neutral = Decimal("0.0")
+        rate_1h_neutral = Decimal("0.0")
+        is_ready = True
+        is_inverted_neutral = (
+            rate_1h_neutral is not None and
+            is_ready and
+            curr_apr_neutral < config.inversion_exit_apr and
+            curr_apr_neutral < Decimal("0.0")
+        )
+        self.assertFalse(is_inverted_neutral, "Neutral APR (0.0%) must never trigger inversion exit")
+
+        # Scenario 2: Unready connector (is_ready = False) - MUST NOT trigger inversion stop
+        is_ready_false = False
+        is_inverted_unready = (
+            rate_1h_neutral is not None and
+            is_ready_false and
+            curr_apr_neutral < config.inversion_exit_apr and
+            curr_apr_neutral < Decimal("0.0")
+        )
+        self.assertFalse(is_inverted_unready, "Unready connector must not trigger inversion exit")
+
+        # Scenario 3: Genuinely adverse funding (APR = -15% < -5%) - MUST trigger inversion stop
+        curr_apr_adverse = Decimal("-0.15")
+        rate_1h_adverse = Decimal("-0.00001712")
+        is_inverted_adverse = (
+            rate_1h_adverse is not None and
+            is_ready and
+            curr_apr_adverse < config.inversion_exit_apr and
+            curr_apr_adverse < Decimal("0.0")
+        )
+        self.assertTrue(is_inverted_adverse, "Adverse funding (APR -15% < -5%) must trigger inversion exit")
+
+    def test_multi_cycle_discrete_funding_catchup(self):
+        strategy = SpotPerpCashCarryStrategy.__new__(SpotPerpCashCarryStrategy)
+        strategy._set_current_timestamp(1000000.0)
+        strategy.config = SpotPerpCashCarryConfig()
+        strategy.logger = MagicMock()
+        strategy._persist_state = MagicMock()
+
+        # Mock connector returning 1.5 bps/h
+        mock_conn = MagicMock()
+        mock_info = MagicMock()
+        mock_info.rate = "0.00015"
+        mock_conn.get_funding_info.return_value = mock_info
+        strategy.connectors = {"hyperliquid_perpetual": mock_conn}
+
+        # Position that missed 3 cycles (was due at -2h, -1h, and now: 3 settlements)
+        # 1000000 - 2 * 3600 = 992800
+        strategy.active_positions = {
+            "ENA": {
+                "token": "ENA",
+                "is_virtual": True,
+                "perp_connector": "hyperliquid_perpetual",
+                "position_size": 1000.0,
+                "settled_funding_pnl": 0.0,
+                "funding_payments": [],
+                "next_funding_time": 992800,  # 2 hours overdue + current tick = 3 cycles
+            }
+        }
+
+        strategy.account_for_discrete_funding_settlements()
+        pos = strategy.active_positions["ENA"]
+        # Expected: 3 cycles * (1000 * 0.00015 = 0.15) = $0.45 USDC
+        self.assertAlmostEqual(pos["settled_funding_pnl"], 0.45, places=3)
+        self.assertEqual(len(pos["funding_payments"]), 3)
+        self.assertGreater(pos["next_funding_time"], strategy.current_timestamp)
+
+    def test_quantize_order_amount_alignment(self):
+        strategy = SpotPerpCashCarryStrategy.__new__(SpotPerpCashCarryStrategy)
+        strategy.config = SpotPerpCashCarryConfig()
+
+        mock_spot_conn = MagicMock()
+        mock_perp_conn = MagicMock()
+
+        # Step size 1.0 on Spot, step size 10.0 on Perp
+        mock_spot_conn.quantize_order_amount.side_effect = lambda tp, amt: Decimal(str(int(amt)))
+        mock_perp_conn.quantize_order_amount.side_effect = lambda tp, amt: Decimal(str(int(amt // 10) * 10))
+
+        strategy.connectors = {
+            "binance": mock_spot_conn,
+            "hyperliquid_perpetual": mock_perp_conn,
+        }
+
+        # Raw amount 125.75 tokens, $2.00 price
+        raw_amt = Decimal("125.75")
+        p_spot = Decimal("2.00")
+        p_perp = Decimal("2.00")
+
+        quantized = strategy.quantize_order_amount("ENA", raw_amt, p_spot, p_perp)
+        # Should be quantized to 120.0
+        self.assertEqual(quantized, Decimal("120"))
 
 
 if __name__ == "__main__":
